@@ -20,6 +20,7 @@ use crate::batch::{
 };
 use crate::change::{ChangeEntry, ChangesPage, SyncCursor, kind as change_kind};
 use crate::error::StoreError;
+use crate::folder::{DEFAULT_FOLDERS, Folder, FolderRecord, validate_folder_name};
 use crate::format::{
     DEFAULT_DATA_LANES, DEFAULT_LANE_CAPACITY, FIRST_DATA_LANE, FORMAT_VERSION, INDEX_LANE,
     LANE_HEADER_SIZE, LaneHeader, MAX_LANE_CAPACITY, MIN_LANE_CAPACITY, SUPERBLOCK_A_OFFSET,
@@ -126,10 +127,11 @@ struct Snapshot {
     index: SearchIndex,
     catalog: HashMap<String, Location>,
     changes: HashMap<String, Vec<ChangeEntry>>,
+    folders: HashMap<String, BTreeMap<String, Folder>>,
     lanes: Vec<LanePosition>,
 }
 
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
 const SNAPSHOT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, SilentProto)]
@@ -181,6 +183,7 @@ struct DbInner {
     index: RwLock<SearchIndex>,
     catalog: RwLock<HashMap<String, Location>>,
     changes: RwLock<HashMap<String, Vec<ChangeEntry>>>,
+    folders: RwLock<HashMap<String, BTreeMap<String, Folder>>>,
     lane_locks: Vec<Arc<futures::lock::Mutex<()>>>,
     options: StoreOptions,
 }
@@ -282,6 +285,10 @@ impl Db {
             .as_ref()
             .map(|snapshot| snapshot.changes.clone())
             .unwrap_or_default();
+        let mut folders = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.folders.clone())
+            .unwrap_or_default();
         let mut lanes = Vec::with_capacity(superblock.lane_count as usize);
         let mut init_ring = io_uring::IoUring::new(8).map_err(StoreError::Io)?;
 
@@ -330,6 +337,7 @@ impl Db {
                             &mut index,
                             &mut catalog,
                             &mut changes,
+                            &mut folders,
                         )?;
                     }
                     offset += batch.total_len;
@@ -382,6 +390,7 @@ impl Db {
             index: RwLock::new(index),
             catalog: RwLock::new(catalog),
             changes: RwLock::new(changes),
+            folders: RwLock::new(folders),
             lane_locks,
             options,
         };
@@ -495,6 +504,175 @@ impl Db {
 
     pub fn index_size(&self) -> usize {
         self.state().index.read().len()
+    }
+
+    pub fn list_folders(&self, account_id: &str) -> Vec<Folder> {
+        self.state()
+            .folders
+            .read()
+            .get(account_id)
+            .map(|folders| folders.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub async fn ensure_default_folders(&self, account_id: &str) -> Result<(), StoreError> {
+        let existing = self
+            .state()
+            .folders
+            .read()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default();
+        let records = DEFAULT_FOLDERS
+            .iter()
+            .filter(|(name, _)| !existing.contains_key(*name))
+            .map(|(name, role)| {
+                Record::new(
+                    KIND_META,
+                    format!("folder:{name}"),
+                    FolderRecord::create(account_id, name, role)
+                        .encode()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return Ok(());
+        }
+        self.append_batch(account_id, NewBatch::new(records))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_folder(&self, account_id: &str, name: &str) -> Result<Receipt, StoreError> {
+        validate_folder_name(name).map_err(StoreError::Config)?;
+        if self
+            .state()
+            .folders
+            .read()
+            .get(account_id)
+            .is_some_and(|folders| folders.contains_key(name))
+        {
+            return Err(StoreError::Config("folder already exists".into()));
+        }
+        let record = FolderRecord::create(account_id, name, "custom");
+        self.append_batch(
+            account_id,
+            NewBatch::single(Record::new(
+                KIND_META,
+                format!("folder:{name}"),
+                record.encode()?,
+            )),
+        )
+        .await
+    }
+
+    pub async fn delete_folder(&self, account_id: &str, name: &str) -> Result<usize, StoreError> {
+        if DEFAULT_FOLDERS.iter().any(|(default, _)| *default == name) {
+            return Err(StoreError::Config("cannot delete a default folder".into()));
+        }
+        self.ensure_default_folders(account_id).await?;
+        let ids = self
+            .state()
+            .index
+            .read()
+            .iter()
+            .filter(|doc| doc.account_id == account_id && doc.mailbox == name)
+            .map(|doc| doc.id.clone())
+            .collect::<Vec<_>>();
+        self.move_many(account_id, &ids, "Trash").await?;
+        let record = FolderRecord::delete(account_id, name, "custom");
+        self.append_batch(
+            account_id,
+            NewBatch::single(Record::new(
+                KIND_META,
+                format!("folder:{name}"),
+                record.encode()?,
+            )),
+        )
+        .await?;
+        Ok(ids.len())
+    }
+
+    pub async fn rename_folder(
+        &self,
+        account_id: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<usize, StoreError> {
+        validate_folder_name(new_name).map_err(StoreError::Config)?;
+        if DEFAULT_FOLDERS
+            .iter()
+            .any(|(default, _)| *default == old_name)
+        {
+            return Err(StoreError::Config("cannot rename a default folder".into()));
+        }
+        let exists = self
+            .state()
+            .folders
+            .read()
+            .get(account_id)
+            .is_some_and(|folders| folders.contains_key(old_name));
+        if !exists {
+            return Err(StoreError::NotFound(old_name.into()));
+        }
+        let conflict = self
+            .state()
+            .folders
+            .read()
+            .get(account_id)
+            .is_some_and(|folders| folders.contains_key(new_name));
+        if conflict {
+            return Err(StoreError::Config("folder already exists".into()));
+        }
+        let ids = self
+            .state()
+            .index
+            .read()
+            .iter()
+            .filter(|doc| doc.account_id == account_id && doc.mailbox == old_name)
+            .map(|doc| doc.id.clone())
+            .collect::<Vec<_>>();
+        self.move_many(account_id, &ids, new_name).await?;
+        let mut records = vec![Record::new(
+            KIND_META,
+            format!("folder:{new_name}"),
+            FolderRecord::create(account_id, new_name, "custom").encode()?,
+        )];
+        records.push(Record::new(
+            KIND_META,
+            format!("folder:{old_name}"),
+            FolderRecord::delete(account_id, old_name, "custom").encode()?,
+        ));
+        self.append_batch(account_id, NewBatch::new(records))
+            .await?;
+        Ok(ids.len())
+    }
+
+    async fn move_many(
+        &self,
+        account_id: &str,
+        ids: &[String],
+        mailbox: &str,
+    ) -> Result<(), StoreError> {
+        for chunk in ids.chunks(500) {
+            let records = chunk
+                .iter()
+                .map(|id| {
+                    let payload = MovePayload {
+                        account_id: account_id.to_string(),
+                        mailbox: mailbox.to_string(),
+                    }
+                    .encode()?;
+                    Ok(Record::new(KIND_MOVE, id.clone(), payload))
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            if !records.is_empty() {
+                self.append_batch(account_id, NewBatch::new(records))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     pub fn account_stats(&self, account_id: &str) -> AccountStats {
@@ -653,6 +831,7 @@ impl Db {
             index: self.state().index.read().clone(),
             catalog: self.state().catalog.read().clone(),
             changes: self.state().changes.read().clone(),
+            folders: self.state().folders.read().clone(),
             lanes: positions.clone(),
         };
         let bytes = snapshot.encode()?;
@@ -752,6 +931,7 @@ impl Db {
         let mut index = inner.index.write();
         let mut catalog = inner.catalog.write();
         let mut changes = inner.changes.write();
+        let mut folders = inner.folders.write();
         for (record_index, record) in records.iter().enumerate() {
             match record.kind {
                 KIND_MESSAGE => {
@@ -795,6 +975,11 @@ impl Db {
                         let mut entry = ChangeEntry::from_doc(seq, change_kind::MOVE, doc);
                         entry.mailbox = payload.mailbox.clone();
                         push_change(&mut changes, entry);
+                    }
+                }
+                KIND_META if record.key.starts_with("folder:") => {
+                    if let Ok(folder) = FolderRecord::decode(&record.payload) {
+                        apply_folder(&mut folders, folder);
                     }
                 }
                 _ => {}
@@ -993,6 +1178,7 @@ fn apply_batch_to_maps(
     index: &mut SearchIndex,
     catalog: &mut HashMap<String, Location>,
     changes: &mut HashMap<String, Vec<ChangeEntry>>,
+    folders: &mut HashMap<String, BTreeMap<String, Folder>>,
 ) -> Result<(), StoreError> {
     let seq = batch.seq;
     for (record_index, record) in batch.records.iter().enumerate() {
@@ -1040,10 +1226,24 @@ fn apply_batch_to_maps(
                     push_change(changes, entry);
                 }
             }
+            KIND_META if record.key.starts_with("folder:") => {
+                if let Ok(folder) = FolderRecord::decode(&record.payload) {
+                    apply_folder(folders, folder);
+                }
+            }
             _ => {}
         }
     }
     Ok(())
+}
+
+fn apply_folder(folders: &mut HashMap<String, BTreeMap<String, Folder>>, folder: FolderRecord) {
+    let entry = folders.entry(folder.account_id.clone()).or_default();
+    if folder.deleted {
+        entry.remove(&folder.name);
+    } else {
+        entry.insert(folder.name.clone(), folder.to_folder());
+    }
 }
 
 fn push_change(changes: &mut HashMap<String, Vec<ChangeEntry>>, entry: ChangeEntry) {
@@ -1327,6 +1527,51 @@ mod tests {
         drop(db);
         let db = Db::open(&path, options()).unwrap();
         assert_eq!(db.index_size(), 100);
+    }
+
+    #[test]
+    fn folder_crud_moves_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.tide");
+        let db = Db::open(&path, options()).unwrap();
+        futures::executor::block_on(db.ensure_default_folders("alice")).unwrap();
+        assert!(
+            db.list_folders("alice")
+                .iter()
+                .any(|folder| folder.name == "INBOX")
+        );
+        assert!(
+            db.list_folders("alice")
+                .iter()
+                .any(|folder| folder.name == "Junk")
+        );
+        futures::executor::block_on(db.create_folder("alice", "Projects")).unwrap();
+        db.append_message_blocking(message("1", "alice", "Project", "body"))
+            .unwrap();
+        futures::executor::block_on(db.move_message("1", "alice", "Projects")).unwrap();
+        assert_eq!(
+            futures::executor::block_on(db.rename_folder("alice", "Projects", "Work")).unwrap(),
+            1
+        );
+        assert_eq!(db.get_message("1").unwrap().unwrap().mailbox, "Work");
+        assert_eq!(
+            futures::executor::block_on(db.delete_folder("alice", "Work")).unwrap(),
+            1
+        );
+        assert_eq!(db.get_message("1").unwrap().unwrap().mailbox, "Trash");
+        drop(db);
+        let db = Db::open(&path, options()).unwrap();
+        assert!(
+            db.list_folders("alice")
+                .iter()
+                .any(|folder| folder.name == "INBOX")
+        );
+        assert!(
+            !db.list_folders("alice")
+                .iter()
+                .any(|folder| folder.name == "Work")
+        );
+        assert_eq!(db.get_message("1").unwrap().unwrap().mailbox, "Trash");
     }
 
     #[test]

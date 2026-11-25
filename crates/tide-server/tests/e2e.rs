@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use silent_protocol::SilentProto;
 use tide_proto::{
-    AuthRequest, AuthResponse, Cursor, FlagsRequest, GetMessageRequest, GetMessageResponse,
-    ListRequest, ListResponse, PutMessagePayload, SearchRequest, SearchResponse, SyncOperation,
-    flags_mode, op_kind,
+    AttachmentData, AuthRequest, AuthResponse, Cursor, FlagsRequest, FolderCreateRequest,
+    FolderListRequest, GetMessageRequest, GetMessageResponse, ListRequest, ListResponse,
+    MailboxListResponse, PutMessagePayload, SearchRequest, SearchResponse, SendResponse,
+    SendWithAttachmentsRequest, SyncOperation, flags_mode, op_kind,
 };
 use tide_smtp::SmtpClient;
 use tide_sync::{ClientEvent, ClientSession};
@@ -59,6 +60,14 @@ admin_token = "admin"
 [tls]
 self_signed = false
 
+[email_auth]
+enabled = false
+
+[spam]
+enabled = true
+threshold = 1.0
+reject_threshold = 100.0
+
 [[accounts]]
 email = "alice@mail.local"
 password = "secret"
@@ -71,7 +80,7 @@ name = "Alice"
     let child = Command::new(env!("CARGO_BIN_EXE_tide"))
         .arg(&config_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let server = Server {
@@ -183,6 +192,40 @@ fn read_frame(stream: &mut TcpStream) -> tide_proto::Frame {
 fn smtp_http_and_sync_end_to_end() {
     let server = start_server();
     let (token, _) = login(&server);
+    let create = FolderCreateRequest {
+        account_id: "alice@mail.local".into(),
+        name: "Projects".into(),
+    };
+    assert_eq!(
+        http_request(
+            &server.http,
+            "POST",
+            "/v1/folders/create",
+            Some(&token),
+            &create.encode().unwrap(),
+        )
+        .0,
+        200
+    );
+    let list = FolderListRequest {
+        account_id: "alice@mail.local".into(),
+    };
+    let (status, body) = http_request(
+        &server.http,
+        "POST",
+        "/v1/folders/list",
+        Some(&token),
+        &list.encode().unwrap(),
+    );
+    assert_eq!(status, 200);
+    let folders = MailboxListResponse::decode(&body).unwrap();
+    assert!(
+        folders
+            .mailboxes
+            .iter()
+            .any(|folder| folder.name == "Projects")
+    );
+    assert!(folders.mailboxes.iter().any(|folder| folder.name == "Junk"));
 
     let mut smtp = SmtpClient::connect(server.smtp.as_str()).unwrap();
     assert_eq!(smtp.read_reply().unwrap().code, 220);
@@ -228,8 +271,34 @@ fn smtp_http_and_sync_end_to_end() {
     let message = GetMessageResponse::decode(&body).unwrap();
     assert!(String::from_utf8_lossy(&message.body.raw).contains("Hello E2E body"));
 
+    let spam_raw = b"From: spam@example.com\r\nTo: alice@mail.local\r\nSubject: WINNER\r\nDate: Tue, 25 Nov 2025 12:10:00 +0000\r\nMessage-ID: <spam@example.com>\r\n\r\nclick here to claim your prize\r\n";
+    smtp = SmtpClient::connect(server.smtp.as_str()).unwrap();
+    assert_eq!(smtp.read_reply().unwrap().code, 220);
+    smtp.ehlo("client.local").unwrap();
+    smtp.send_message("spam@example.com", &["alice@mail.local".into()], spam_raw)
+        .unwrap();
+    smtp.quit().unwrap();
+    let junk = ListRequest {
+        account_id: "alice@mail.local".into(),
+        mailbox: Some("Junk".into()),
+        limit: 10,
+        ..ListRequest::default()
+    };
+    let (status, body) = http_request(
+        &server.http,
+        "POST",
+        "/v1/messages/list",
+        Some(&token),
+        &junk.encode().unwrap(),
+    );
+    assert_eq!(status, 200);
+    let junk = ListResponse::decode(&body).unwrap();
+    assert_eq!(junk.messages.len(), 1);
+    assert_eq!(junk.messages[0].subject, "WINNER");
+
     let list = ListRequest {
         account_id: "alice@mail.local".into(),
+        mailbox: Some("INBOX".into()),
         limit: 10,
         ..ListRequest::default()
     };
@@ -369,6 +438,38 @@ fn smtp_http_and_sync_end_to_end() {
     let results = SearchResponse::decode(&body).unwrap();
     assert_eq!(results.hits.len(), 1);
     assert_eq!(results.hits[0].message.subject, "Sync pushed");
+
+    let attachment = SendWithAttachmentsRequest {
+        account_id: "alice@mail.local".into(),
+        attachments: vec![AttachmentData {
+            filename: "report.txt".into(),
+            content_type: "text/plain".into(),
+            data: b"attachment-bytes".to_vec(),
+        }],
+        envelope_from: "alice@mail.local".into(),
+        envelope_to: vec!["alice@mail.local".into()],
+        html: None,
+        subject: "With attachment".into(),
+        text: "See attached".into(),
+    };
+    let (status, body) = http_request(
+        &server.http,
+        "POST",
+        "/v1/send/attachments",
+        Some(&token),
+        &attachment.encode().unwrap(),
+    );
+    assert_eq!(status, 200);
+    let sent = SendResponse::decode(&body).unwrap();
+    let (status, body) = http_request(
+        &server.http,
+        "GET",
+        &format!("/v1/attachments/{}/0", sent.message_id),
+        Some(&token),
+        b"",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, b"attachment-bytes");
 
     assert_eq!(admin_request(&server.http, "/v1/admin/snapshot").0, 200);
     assert_eq!(admin_request(&server.http, "/v1/admin/compact").0, 200);

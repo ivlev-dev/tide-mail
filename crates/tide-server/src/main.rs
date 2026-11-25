@@ -2,13 +2,16 @@ mod app;
 mod auth;
 mod config;
 mod convert;
+mod dsn;
 mod email_auth;
 mod http;
+mod mime_build;
 mod net;
 mod outbound;
 mod smtp;
 mod sync_server;
 mod tls;
+mod tls_policy;
 
 use std::sync::Arc;
 
@@ -81,6 +84,25 @@ fn main() {
     } else {
         None
     };
+    let spam = if config.spam.enabled {
+        let mut filters: Vec<Box<dyn tide_spam::SpamFilter>> =
+            vec![Box::new(tide_spam::RuleFilter)];
+        if !config.spam.dnsbl_zones.is_empty() {
+            filters.push(Box::new(tide_spam::DnsblFilter::new(
+                config.spam.dnsbl_zones.clone(),
+            )));
+        }
+        if let Some(command) = config.spam.external_command.clone() {
+            filters.push(Box::new(tide_spam::ExternalFilter::new(command)));
+        }
+        Some(std::sync::Arc::new(tide_spam::SpamEngine::new(
+            filters,
+            config.spam.threshold,
+            config.spam.reject_threshold,
+        )))
+    } else {
+        None
+    };
     let outbound = if config.server.outbound_enabled {
         let outbound_dir = config
             .server
@@ -92,11 +114,22 @@ fn main() {
             config.server.hostname.clone(),
             dkim.clone(),
             config.server.outbound_tls,
+            config.server.dsn_enabled,
+            tls_policy::MtaStsCache::new(config.server.mta_sts),
+            config.server.dane,
         ))
     } else {
         None
     };
-    let app = App::new(config.clone(), db, registry, tls, outbound, email_auth);
+    let app = App::new(
+        config.clone(),
+        db,
+        registry,
+        tls,
+        outbound,
+        email_auth,
+        spam,
+    );
 
     println!(
         "Tide Mail: {} ({} воркеров)",

@@ -125,16 +125,23 @@ async fn deliver(
     envelope: tide_smtp::Envelope,
     mut data: Vec<u8>,
 ) -> tide_smtp::Reply {
+    let mut spf_fail = false;
+    let mut dkim_fail = false;
+    let mut dmarc_fail = false;
     if !submission && app.config.email_auth.enabled {
         if let Some(authenticator) = app.email_auth.clone() {
             let hostname = app.config.server.hostname.clone();
             let mail_from = envelope.from.clone();
             let raw = data.clone();
+            let auth_helo = helo.clone();
             let handle = monoio::spawn_blocking(move || {
-                crate::email_auth::verify(authenticator, hostname, peer, helo, mail_from, raw)
+                crate::email_auth::verify(authenticator, hostname, peer, auth_helo, mail_from, raw)
             });
             match handle.await {
                 Ok(Ok(verification)) => {
+                    spf_fail = verification.spf_fail;
+                    dkim_fail = verification.dkim_fail;
+                    dmarc_fail = verification.dmarc_fail;
                     if app.config.email_auth.reject_spf_fail && verification.spf_fail {
                         return tide_smtp::Reply::new(550, "5.7.23 SPF policy rejection");
                     }
@@ -147,6 +154,47 @@ async fn deliver(
                 }
                 Ok(Err(error)) => eprintln!("email auth: {error}"),
                 Err(_) => eprintln!("email auth: verification task cancelled"),
+            }
+        }
+    }
+    if !submission && crate::dsn::is_dsn(&data) {
+        let mut augmented = b"X-Tide-DSN: yes\r\n".to_vec();
+        augmented.extend_from_slice(&data);
+        data = augmented;
+    }
+    let mut spam = false;
+    if !submission {
+        if let Some(engine) = app.spam.clone() {
+            let raw = data.clone();
+            let helo = helo.clone();
+            let mail_from = envelope.from.clone();
+            let handle = monoio::spawn_blocking(move || {
+                let context = tide_spam::SpamContext::new(
+                    peer, &helo, &mail_from, &raw, spf_fail, dkim_fail, dmarc_fail,
+                );
+                let verdict = engine.check(&context);
+                let is_spam = engine.is_spam(&verdict);
+                (verdict, is_spam)
+            });
+            match handle.await {
+                Ok((verdict, is_spam)) => {
+                    if verdict.reject {
+                        return tide_smtp::Reply::new(550, "5.7.1 Message rejected as spam");
+                    }
+                    spam = is_spam;
+                    let status = if is_spam { "Yes" } else { "No" };
+                    let mut header = format!(
+                        "X-Spam-Score: {:.1}\r\nX-Spam-Status: {status}\r\n",
+                        verdict.score
+                    );
+                    if !verdict.rules.is_empty() {
+                        header.push_str(&format!("X-Spam-Rules: {}\r\n", verdict.rules.join(", ")));
+                    }
+                    let mut augmented = header.into_bytes();
+                    augmented.extend_from_slice(&data);
+                    data = augmented;
+                }
+                Err(_) => eprintln!("spam filter: task cancelled"),
             }
         }
     }
@@ -187,8 +235,12 @@ async fn deliver(
         };
     }
     for recipient in local {
+        if let Err(error) = app.db.ensure_default_folders(&recipient).await {
+            eprintln!("folders: {error}");
+        }
+        let mailbox = if spam { "Junk" } else { "INBOX" };
         let id = Uuid::new_v4().to_string();
-        let message = match parse_message(&data, recipient.clone(), "INBOX", id) {
+        let message = match parse_message(&data, recipient.clone(), mailbox, id) {
             Ok(message) => message,
             Err(error) => {
                 eprintln!("smtp parse: {error}");

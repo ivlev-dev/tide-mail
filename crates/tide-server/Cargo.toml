@@ -14,9 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 argon2 = "0.5"
+base64.workspace = true
 bincode.workspace = true
 hickory-resolver.workspace = true
 mail-auth.workspace = true
+mail-parser.workspace = true
 tokio.workspace = true
 futures.workspace = true
 httparse = "1"
@@ -26,6 +28,9 @@ parking_lot.workspace = true
 rcgen = "0.14"
 rustls = "0.23"
 rustls-pemfile = "2"
+x509-parser.workspace = true
+sha2.workspace = true
+reqwest.workspace = true
 rand_core.workspace = true
 serde = { version = "1", features = ["derive"] }
 silent-protocol.workspace = true
@@ -35,6 +40,7 @@ tide-proto = { path = "../tide-proto" }
 tide-smtp = { path = "../tide-smtp" }
 tide-store = { path = "../tide-store" }
 tide-sync = { path = "../tide-sync" }
+tide-spam = { path = "../tide-spam" }
 toml = "0.8"
 uuid.workspace = true
 webpki-roots.workspace = true

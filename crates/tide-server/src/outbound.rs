@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use hickory_resolver::Resolver;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls::{ClientConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
 use tide_smtp::SmtpClient;
 use uuid::Uuid;
 
 use crate::config::DkimSettings;
+use crate::tls_policy::MtaStsCache;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundJob {
@@ -20,6 +21,10 @@ pub struct OutboundJob {
     pub from: String,
     pub to: String,
     pub raw: Vec<u8>,
+    #[serde(default)]
+    pub message_id: String,
+    #[serde(default)]
+    pub dsn: bool,
 }
 
 #[derive(Clone)]
@@ -34,11 +39,16 @@ impl OutboundQueue {
         hostname: String,
         dkim: Option<DkimSettings>,
         tls: bool,
+        dsn_enabled: bool,
+        mta_sts: Arc<MtaStsCache>,
+        dane: bool,
     ) -> Arc<Self> {
         let dir = dir.into();
         let _ = fs::create_dir_all(&dir);
         let (tx, rx) = channel::<OutboundJob>();
         let workdir = dir.clone();
+        let sender = tx.clone();
+        let policy = Arc::clone(&mta_sts);
         let mut initial = Vec::new();
         for entry in fs::read_dir(&workdir).into_iter().flatten().flatten() {
             let path = entry.path();
@@ -55,10 +65,30 @@ impl OutboundQueue {
             .name("tide-outbound".into())
             .spawn(move || {
                 for job in initial {
-                    deliver_with_retry(&hostname, dkim.as_ref(), tls, &workdir, &job);
+                    deliver_with_retry(
+                        &hostname,
+                        dkim.as_ref(),
+                        tls,
+                        dsn_enabled,
+                        &workdir,
+                        &sender,
+                        &policy,
+                        dane,
+                        &job,
+                    );
                 }
                 while let Ok(job) = rx.recv() {
-                    deliver_with_retry(&hostname, dkim.as_ref(), tls, &workdir, &job);
+                    deliver_with_retry(
+                        &hostname,
+                        dkim.as_ref(),
+                        tls,
+                        dsn_enabled,
+                        &workdir,
+                        &sender,
+                        &policy,
+                        dane,
+                        &job,
+                    );
                 }
             })
             .expect("outbound worker");
@@ -69,15 +99,9 @@ impl OutboundQueue {
         if job.id.is_empty() {
             job.id = Uuid::new_v4().to_string();
         }
-        let path = self.dir.join(format!("{}.bin", job.id));
-        let temp = self.dir.join(format!("{}.tmp", job.id));
-        let Ok(bytes) = bincode::serialize(&job) else {
+        let Some(job) = write_job(&self.dir, job) else {
             return false;
         };
-        if fs::write(&temp, bytes).is_err() || fs::rename(&temp, &path).is_err() {
-            let _ = fs::remove_file(&temp);
-            return false;
-        }
         self.tx.send(job).is_ok()
     }
 
@@ -87,15 +111,22 @@ impl OutboundQueue {
             from: from.into(),
             to: to.into(),
             raw,
+            message_id: String::new(),
+            dsn: false,
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deliver_with_retry(
     hostname: &str,
     dkim: Option<&DkimSettings>,
     tls: bool,
+    dsn_enabled: bool,
     dir: &Path,
+    sender: &Sender<OutboundJob>,
+    policy: &Arc<MtaStsCache>,
+    dane: bool,
     job: &OutboundJob,
 ) {
     let raw = match dkim {
@@ -110,7 +141,7 @@ fn deliver_with_retry(
     };
     let mut delay = Duration::from_secs(1);
     for attempt in 1..=3 {
-        match deliver_once(hostname, tls, job, &raw) {
+        match deliver_once(hostname, tls, policy, dane, job, &raw) {
             Ok(()) => {
                 eprintln!("outbound {} -> {}: delivered", job.from, job.to);
                 let _ = fs::remove_file(dir.join(format!("{}.bin", job.id)));
@@ -134,18 +165,53 @@ fn deliver_with_retry(
         job.to,
         dir.join(format!("{}.bin", job.id)).display()
     );
+    if dsn_enabled && !job.dsn && !job.from.is_empty() {
+        let dsn = crate::dsn::build_failure_dsn(job, hostname, "delivery attempt failed");
+        let dsn_job = OutboundJob {
+            id: String::new(),
+            from: String::new(),
+            to: job.from.clone(),
+            raw: dsn,
+            message_id: job.message_id.clone(),
+            dsn: true,
+        };
+        if let Some(dsn_job) = write_job(dir, dsn_job) {
+            let _ = sender.send(dsn_job);
+        }
+        let _ = fs::remove_file(dir.join(format!("{}.bin", job.id)));
+    }
 }
 
-fn deliver_once(hostname: &str, tls: bool, job: &OutboundJob, raw: &[u8]) -> Result<(), String> {
+fn write_job(dir: &Path, mut job: OutboundJob) -> Option<OutboundJob> {
+    if job.id.is_empty() {
+        job.id = Uuid::new_v4().to_string();
+    }
+    let path = dir.join(format!("{}.bin", job.id));
+    let temp = dir.join(format!("{}.tmp", job.id));
+    let bytes = bincode::serialize(&job).ok()?;
+    fs::write(&temp, bytes).ok()?;
+    fs::rename(&temp, &path).ok()?;
+    Some(job)
+}
+
+fn deliver_once(
+    hostname: &str,
+    tls: bool,
+    policy: &Arc<MtaStsCache>,
+    dane: bool,
+    job: &OutboundJob,
+    raw: &[u8],
+) -> Result<(), String> {
     let domain = job
         .to
         .rsplit_once('@')
         .map(|(_, domain)| domain)
         .ok_or_else(|| "recipient has no domain".to_string())?;
     let hosts = resolve_mx(domain)?;
+    let require_tls = policy.check(domain, &hosts, tls)?;
     let mut last_error = String::new();
     for host in hosts {
-        match deliver_host(hostname, tls, &host, job, raw) {
+        match deliver_host(hostname, tls, dane, require_tls, &host, job, raw) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = error,
         }
@@ -156,6 +222,8 @@ fn deliver_once(hostname: &str, tls: bool, job: &OutboundJob, raw: &[u8]) -> Res
 fn deliver_host(
     hostname: &str,
     tls: bool,
+    dane: bool,
+    require_tls: bool,
     host: &str,
     job: &OutboundJob,
     raw: &[u8],
@@ -173,18 +241,30 @@ fn deliver_host(
         return Err(format!("unexpected greeting: {greeting}"));
     }
     let ehlo = client.ehlo(hostname).map_err(|error| error.to_string())?;
-    if tls
-        && ehlo
-            .lines
-            .iter()
-            .any(|line| line.eq_ignore_ascii_case("STARTTLS"))
-    {
+    let offers_starttls = ehlo
+        .lines
+        .iter()
+        .any(|line| line.eq_ignore_ascii_case("STARTTLS"));
+    let records = if dane {
+        crate::tls_policy::lookup_dane(host).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if (require_tls || !records.is_empty()) && !offers_starttls {
+        return Err(format!(
+            "TLS is required for {host}, but STARTTLS is not offered"
+        ));
+    }
+    if !records.is_empty() && !tls {
+        return Err(format!("DANE for {host} requires TLS"));
+    }
+    if tls && offers_starttls {
         let reply = client
             .command("STARTTLS")
             .map_err(|error| error.to_string())?;
         if reply.code == 220 {
             let stream = client.into_inner();
-            let tls_stream = tls_stream(stream, host)?;
+            let tls_stream = tls_stream(stream, host, &records)?;
             let client = SmtpClient::new(tls_stream);
             return send_with_client(client, hostname, job, raw);
         }
@@ -243,12 +323,9 @@ fn resolve_mx(domain: &str) -> Result<Vec<String>, String> {
 fn tls_stream(
     stream: TcpStream,
     host: &str,
+    records: &[crate::tls_policy::DaneRecord],
 ) -> Result<StreamOwned<ClientConnection, TcpStream>, String> {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let config = crate::tls_policy::client_config(records)?;
     let server_name = ServerName::try_from(host.to_string()).map_err(|error| error.to_string())?;
     let connection =
         ClientConnection::new(Arc::new(config), server_name).map_err(|error| error.to_string())?;

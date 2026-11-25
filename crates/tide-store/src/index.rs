@@ -360,6 +360,14 @@ impl SearchIndex {
         } else {
             self.total_length as f64 / self.active_docs as f64
         };
+        let scored_terms = scored_terms
+            .iter()
+            .map(|(source, term)| {
+                let df = df_for(*source, self, term).max(1) as f64;
+                let idf = ((self.active_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+                (*source, term.clone(), idf)
+            })
+            .collect::<Vec<_>>();
         let mut hits = Vec::new();
         for doc_id in candidates.drain(..) {
             let Some(slot) = self.slots.get(doc_id as usize) else {
@@ -385,7 +393,7 @@ impl SearchIndex {
                 1.0
             } else {
                 let mut value = 0.0;
-                for (source, term) in &scored_terms {
+                for (source, term, idf) in &scored_terms {
                     let (tf, weight) = match source {
                         TermSource::Subject => {
                             (tf(&self.subject_terms, term, doc_id), SUBJECT_WEIGHT)
@@ -401,8 +409,6 @@ impl SearchIndex {
                     if tf == 0 {
                         continue;
                     }
-                    let df = df_for(*source, self, term).max(1) as f64;
-                    let idf = ((self.active_docs as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
                     let dl = f64::from(slot.length.max(1));
                     let denominator =
                         f64::from(tf) + 1.2 * (1.0 - 0.75 + 0.75 * dl / avgdl.max(1.0));
@@ -419,7 +425,7 @@ impl SearchIndex {
                 date: slot.doc.date,
                 flags: slot.doc.flags,
                 score: (score * 1000.0).round() as u64,
-                snippet: make_snippet(&slot.doc, &scored_terms),
+                snippet: String::new(),
             });
         }
 
@@ -431,7 +437,23 @@ impl SearchIndex {
                 .then_with(|| left.id.cmp(&right.id))
         });
         let limit = query.limit.clamp(1, MAX_LIMIT);
-        hits.into_iter().skip(query.offset).take(limit).collect()
+        let mut selected = hits
+            .into_iter()
+            .skip(query.offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+        for hit in &mut selected {
+            if let Some(doc) = self.get(&hit.id) {
+                hit.snippet = make_snippet(
+                    doc,
+                    &scored_terms
+                        .iter()
+                        .map(|(source, term, _)| (*source, term.clone()))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        selected
     }
 }
 

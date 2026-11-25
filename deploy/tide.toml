@@ -21,6 +21,13 @@ self_signed = true
 # cert_path = "/etc/tide/fullchain.pem"
 # key_path = "/etc/tide/privkey.pem"
 
+[spam]
+enabled = true
+threshold = 5.0
+reject_threshold = 15.0
+# dnsbl_zones = ["zen.spamhaus.org"]
+# external_command = "spamassassin"
+
 [email_auth]
 enabled = true
 reject_spf_fail = false

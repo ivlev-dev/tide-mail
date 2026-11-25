@@ -36,6 +36,10 @@ Authorization: Bearer <token>
 | POST | `/v1/auth/login` | `AuthRequest` | `AuthResponse` |
 | POST | `/v1/auth/logout` | — | `AckResponse` |
 | POST | `/v1/mailboxes` | `MailboxListRequest` | `MailboxListResponse` |
+| POST | `/v1/folders/list` | `FolderListRequest` | `MailboxListResponse` |
+| POST | `/v1/folders/create` | `FolderCreateRequest` | `AckResponse` |
+| POST | `/v1/folders/rename` | `FolderRenameRequest` | `AckResponse` |
+| POST | `/v1/folders/delete` | `FolderDeleteRequest` | `AckResponse` |
 | POST | `/v1/messages/list` | `ListRequest` | `ListResponse` |
 | POST | `/v1/messages/get` | `GetMessageRequest` | `GetMessageResponse` |
 | POST | `/v1/search` | `SearchRequest` | `SearchResponse` |
@@ -43,6 +47,8 @@ Authorization: Bearer <token>
 | POST | `/v1/messages/delete` | `DeleteRequest` | `AckResponse` |
 | POST | `/v1/messages/move` | `MoveRequest` | `AckResponse` |
 | POST | `/v1/send` | `SendRequest` | `SendResponse` |
+| POST | `/v1/send/attachments` | `SendWithAttachmentsRequest` | `SendResponse` |
+| GET | `/v1/attachments/{message_id}/{attachment_id}` | — | raw file |
 | POST | `/v1/admin/snapshot` | — | `AckResponse` |
 | POST | `/v1/admin/compact` | — | `AckResponse` |
 
@@ -104,6 +110,10 @@ let body = login.encode()?;
 - `tide_proto::MessageMeta` — метаданные для списков/поиска.
 - `tide_proto::MessageBody` — text/html, вложения, raw.
 - Вложения в API адресуются индексом (`AttachmentMeta.id`), blob можно забрать через sync `BLOB_REQUEST`.
+
+## Вложения
+
+`GET /v1/attachments/...` отдаёт raw bytes с `Content-Type` и `Content-Disposition`. `attachment_id` — индекс в `Message.attachments` (он же `AttachmentMeta.id`). Лимит загрузки — 64 МиБ.
 
 ## CORS и TLS
 

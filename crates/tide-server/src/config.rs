@@ -14,6 +14,8 @@ pub struct Config {
     pub email_auth: EmailAuthSettings,
     #[serde(default)]
     pub dkim: DkimSettings,
+    #[serde(default)]
+    pub spam: SpamSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +39,12 @@ pub struct ServerSettings {
     pub outbound_tls: bool,
     #[serde(default)]
     pub outbound_dir: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    pub dsn_enabled: bool,
+    #[serde(default = "default_true")]
+    pub mta_sts: bool,
+    #[serde(default)]
+    pub dane: bool,
     #[serde(default = "default_snapshot_interval")]
     pub snapshot_interval_secs: u64,
     #[serde(default)]
@@ -71,6 +79,9 @@ impl Default for ServerSettings {
             outbound_enabled: false,
             outbound_tls: true,
             outbound_dir: None,
+            dsn_enabled: true,
+            mta_sts: true,
+            dane: false,
             snapshot_interval_secs: 300,
             admin_token: None,
         }
@@ -95,6 +106,40 @@ pub struct DkimSettings {
     pub selector: String,
     #[serde(default)]
     pub private_key_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpamSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_spam_threshold")]
+    pub threshold: f32,
+    #[serde(default = "default_reject_threshold")]
+    pub reject_threshold: f32,
+    #[serde(default)]
+    pub dnsbl_zones: Vec<String>,
+    #[serde(default)]
+    pub external_command: Option<String>,
+}
+
+fn default_spam_threshold() -> f32 {
+    5.0
+}
+
+fn default_reject_threshold() -> f32 {
+    15.0
+}
+
+impl Default for SpamSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: default_spam_threshold(),
+            reject_threshold: default_reject_threshold(),
+            dnsbl_zones: Vec::new(),
+            external_command: None,
+        }
+    }
 }
 
 impl DkimSettings {
@@ -125,9 +170,25 @@ impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&text)?;
+        let mut config: Self = toml::from_str(&text)?;
+        config.normalize();
         config.validate()?;
         Ok(config)
+    }
+
+    fn normalize(&mut self) {
+        if self.server.smtp_addr.as_deref() == Some("") {
+            self.server.smtp_addr = None;
+        }
+        if self.server.smtps_addr.as_deref() == Some("") {
+            self.server.smtps_addr = None;
+        }
+        if self.server.submission_addr.as_deref() == Some("") {
+            self.server.submission_addr = None;
+        }
+        if self.server.sync_addr.as_deref() == Some("") {
+            self.server.sync_addr = None;
+        }
     }
 
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -206,6 +267,9 @@ sync_addr = "127.0.0.1:9093"
 token_ttl_hours = 168
 outbound_enabled = false
 outbound_tls = true
+dsn_enabled = true
+mta_sts = true
+dane = false
 # outbound_dir = "./data/outbound"
 snapshot_interval_secs = 300
 # admin_token = "change-me"
@@ -220,6 +284,13 @@ self_signed = true
 enabled = false
 reject_spf_fail = false
 reject_dmarc_fail = false
+
+[spam]
+enabled = false
+threshold = 5.0
+reject_threshold = 15.0
+# dnsbl_zones = ["zen.spamhaus.org"]
+# external_command = "spamassassin"
 
 [dkim]
 # domain = "mail.local"

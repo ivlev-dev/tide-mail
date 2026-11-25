@@ -6,7 +6,7 @@ use std::sync::Arc;
 use mail_auth::{
     AuthenticatedMessage, AuthenticationResults, DmarcResult, MessageAuthenticator, SpfResult,
     crypto::{RsaKey, Sha256},
-    dkim::DkimSigner,
+    dkim::{DkimResult, DkimSigner},
     dmarc::verify::DmarcParameters,
     headers::HeaderWriter,
     spf::verify::SpfParameters,
@@ -18,6 +18,7 @@ use crate::config::DkimSettings;
 pub struct Verification {
     pub header: String,
     pub spf_fail: bool,
+    pub dkim_fail: bool,
     pub dmarc_fail: bool,
 }
 
@@ -72,6 +73,9 @@ pub fn verify(
         Ok(Verification {
             header: header.to_header(),
             spf_fail: matches!(spf.result(), SpfResult::Fail | SpfResult::SoftFail),
+            dkim_fail: !dkim
+                .iter()
+                .any(|output| matches!(output.result(), DkimResult::Pass)),
             dmarc_fail: dmarc
                 .as_ref()
                 .map(|output| {

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use mail_auth::MessageAuthenticator;
 use monoio_rustls::TlsAcceptor;
+use tide_spam::SpamEngine;
 use tide_store::Db;
 
 use crate::auth::Registry;
@@ -15,6 +16,7 @@ pub struct App {
     pub tls: Option<TlsAcceptor>,
     pub outbound: Option<Arc<OutboundQueue>>,
     pub email_auth: Option<Arc<MessageAuthenticator>>,
+    pub spam: Option<Arc<SpamEngine>>,
 }
 
 impl App {
@@ -25,6 +27,7 @@ impl App {
         tls: Option<TlsAcceptor>,
         outbound: Option<Arc<OutboundQueue>>,
         email_auth: Option<Arc<MessageAuthenticator>>,
+        spam: Option<Arc<SpamEngine>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
@@ -33,6 +36,7 @@ impl App {
             tls,
             outbound,
             email_auth,
+            spam,
         })
     }
 }

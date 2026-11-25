@@ -149,6 +149,30 @@ pub struct MailboxListResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
+pub struct FolderListRequest {
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
+pub struct FolderCreateRequest {
+    pub account_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
+pub struct FolderRenameRequest {
+    pub account_id: String,
+    pub new_name: String,
+    pub old_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
+pub struct FolderDeleteRequest {
+    pub account_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
 pub struct FlagsRequest {
     pub account_id: String,
     pub ids: Vec<String>,
@@ -173,6 +197,24 @@ pub struct MoveRequest {
     pub account_id: String,
     pub ids: Vec<String>,
     pub mailbox: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
+pub struct AttachmentData {
+    pub content_type: String,
+    pub data: Vec<u8>,
+    pub filename: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
+pub struct SendWithAttachmentsRequest {
+    pub account_id: String,
+    pub attachments: Vec<AttachmentData>,
+    pub envelope_from: String,
+    pub envelope_to: Vec<String>,
+    pub html: Option<String>,
+    pub subject: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]

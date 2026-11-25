@@ -7,9 +7,10 @@ use silent_protocol::SilentProto;
 use tide_core::parse_message;
 use tide_proto::{
     Account as ProtoAccount, AckResponse, AuthRequest, AuthResponse, DeleteRequest, ErrorResponse,
-    FlagsRequest, GetMessageRequest, GetMessageResponse, ListRequest, ListResponse, Mailbox,
-    MailboxListRequest, MailboxListResponse, MoveRequest, SearchHit as ProtoSearchHit,
-    SearchRequest, SearchResponse, SendRequest, SendResponse, flags_mode,
+    FlagsRequest, FolderCreateRequest, FolderDeleteRequest, FolderListRequest, FolderRenameRequest,
+    GetMessageRequest, GetMessageResponse, ListRequest, ListResponse, Mailbox, MailboxListRequest,
+    MailboxListResponse, MoveRequest, SearchHit as ProtoSearchHit, SearchRequest, SearchResponse,
+    SendRequest, SendResponse, SendWithAttachmentsRequest, flags_mode,
 };
 use tide_store::{SearchQuery, StoreError};
 use uuid::Uuid;
@@ -150,6 +151,14 @@ impl ApiError {
         }
     }
 
+    fn too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: 413,
+            code: 413,
+            message: message.into(),
+        }
+    }
+
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: 403,
@@ -213,7 +222,7 @@ async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Res
             .get("x-admin-token")
             .map(String::as_str)
             .unwrap_or("");
-        if provided != expected {
+        if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
             return Err(ApiError::forbidden("invalid admin token"));
         }
         return match request.path.as_str() {
@@ -249,6 +258,32 @@ async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Res
     let token = bearer_token(request).ok_or_else(|| ApiError::unauthorized("missing token"))?;
     let account = app.registry.validate_token(&token)?;
 
+    if request.method == "GET" && request.path.starts_with("/v1/attachments/") {
+        let mut parts = request
+            .path
+            .trim_start_matches("/v1/attachments/")
+            .splitn(2, '/');
+        let message_id = parts.next().unwrap_or_default();
+        let attachment_id = parts.next().unwrap_or_default();
+        let message = app
+            .db
+            .get_message(message_id)?
+            .ok_or_else(|| ApiError::not_found("message not found"))?;
+        if message.account_id != account.id {
+            return Err(ApiError::not_found("message not found"));
+        }
+        let index = attachment_id
+            .parse::<usize>()
+            .map_err(|_| ApiError::bad_request("invalid attachment id"))?;
+        let attachment = message
+            .attachments
+            .get(index)
+            .ok_or_else(|| ApiError::not_found("attachment not found"))?;
+        return send_attachment(conn, attachment)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()));
+    }
+
     match (request.method.as_str(), request.path.as_str()) {
         ("POST", "/v1/auth/logout") => {
             app.registry.revoke_token(&token);
@@ -260,16 +295,26 @@ async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Res
             let request = MailboxListRequest::decode(&request.body)
                 .map_err(|error| ApiError::bad_request(error.to_string()))?;
             ensure_account(&account, &request.account_id)?;
+            app.db
+                .ensure_default_folders(&account.id)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
             let stats = app.db.account_stats(&account.id);
-            let mailboxes = ["INBOX", "Sent", "Drafts", "Trash", "Archive"]
+            let mailboxes = app
+                .db
+                .list_folders(&account.id)
                 .into_iter()
-                .map(|name| {
-                    let mailbox = stats.mailboxes.get(name).cloned().unwrap_or_default();
+                .map(|folder| {
+                    let mailbox = stats
+                        .mailboxes
+                        .get(&folder.name)
+                        .cloned()
+                        .unwrap_or_default();
                     Mailbox {
-                        id: name.to_ascii_lowercase(),
+                        id: folder.name.to_ascii_lowercase(),
                         account_id: account.id.clone(),
-                        name: name.into(),
-                        role: name.to_ascii_lowercase(),
+                        name: folder.name,
+                        role: folder.role,
                         total: mailbox.total,
                         unread: mailbox.unread,
                     }
@@ -278,6 +323,89 @@ async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Res
             send_proto(conn, 200, MailboxListResponse { mailboxes })
                 .await
                 .map_err(|error| ApiError::internal(error.to_string()))
+        }
+        ("POST", "/v1/folders/list") => {
+            let request = FolderListRequest::decode(&request.body)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            ensure_account(&account, &request.account_id)?;
+            app.db
+                .ensure_default_folders(&account.id)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            let stats = app.db.account_stats(&account.id);
+            let mailboxes = app
+                .db
+                .list_folders(&account.id)
+                .into_iter()
+                .map(|folder| {
+                    let mailbox = stats
+                        .mailboxes
+                        .get(&folder.name)
+                        .cloned()
+                        .unwrap_or_default();
+                    Mailbox {
+                        id: folder.name.to_ascii_lowercase(),
+                        account_id: account.id.clone(),
+                        name: folder.name,
+                        role: folder.role,
+                        total: mailbox.total,
+                        unread: mailbox.unread,
+                    }
+                })
+                .collect();
+            send_proto(conn, 200, MailboxListResponse { mailboxes })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))
+        }
+        ("POST", "/v1/folders/create") => {
+            let request = FolderCreateRequest::decode(&request.body)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            ensure_account(&account, &request.account_id)?;
+            app.db
+                .create_folder(&account.id, &request.name)
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            send_proto(conn, 200, AckResponse { affected: 1 })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))
+        }
+        ("POST", "/v1/folders/rename") => {
+            let request = FolderRenameRequest::decode(&request.body)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            ensure_account(&account, &request.account_id)?;
+            let affected = app
+                .db
+                .rename_folder(&account.id, &request.old_name, &request.new_name)
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            send_proto(
+                conn,
+                200,
+                AckResponse {
+                    affected: affected as u64,
+                },
+            )
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))
+        }
+        ("POST", "/v1/folders/delete") => {
+            let request = FolderDeleteRequest::decode(&request.body)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            ensure_account(&account, &request.account_id)?;
+            let affected = app
+                .db
+                .delete_folder(&account.id, &request.name)
+                .await
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            send_proto(
+                conn,
+                200,
+                AckResponse {
+                    affected: affected as u64,
+                },
+            )
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))
         }
         ("POST", "/v1/messages/list") => {
             let request = ListRequest::decode(&request.body)
@@ -443,52 +571,136 @@ async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Res
             if request.raw.is_empty() {
                 return Err(ApiError::bad_request("empty message"));
             }
-            let id = Uuid::new_v4().to_string();
-            let mailbox = request.mailbox.unwrap_or_else(|| "Sent".into());
-            let message = parse_message(&request.raw, account.id.clone(), mailbox, id.clone())
-                .map_err(|error| ApiError::bad_request(error.to_string()))?;
-            app.db.append_message(message).await?;
-            let mut queued = false;
-            if let Some(outbound) = app.outbound.as_ref() {
-                for recipient in &request.envelope_to {
-                    if app.registry.account(recipient).is_none()
-                        && outbound.enqueue(crate::outbound::OutboundQueue::job(
-                            request.envelope_from.clone(),
-                            recipient.clone(),
-                            request.raw.clone(),
-                        ))
-                    {
-                        queued = true;
-                    }
-                }
-            }
-            for recipient in &request.envelope_to {
-                if let Some(target) = app.registry.account(recipient) {
-                    if target.id != account.id {
-                        let copy = parse_message(
-                            &request.raw,
-                            target.id.clone(),
-                            "INBOX",
-                            Uuid::new_v4().to_string(),
-                        )
-                        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-                        app.db.append_message(copy).await?;
-                    }
-                }
-            }
-            send_proto(
-                conn,
-                200,
-                SendResponse {
-                    message_id: id,
-                    queued,
-                },
+            let (message_id, queued) = send_raw(
+                app,
+                &account,
+                &request.envelope_from,
+                &request.envelope_to,
+                request.mailbox.as_deref().unwrap_or("Sent"),
+                request.raw,
             )
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))
+            .await?;
+            send_proto(conn, 200, SendResponse { message_id, queued })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))
+        }
+        ("POST", "/v1/send/attachments") => {
+            let request = SendWithAttachmentsRequest::decode(&request.body)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            ensure_account(&account, &request.account_id)?;
+            let attachment_bytes = request
+                .attachments
+                .iter()
+                .map(|attachment| attachment.data.len() as u64)
+                .sum::<u64>();
+            if attachment_bytes > 64 * 1024 * 1024 {
+                return Err(ApiError::too_large("attachments are too large"));
+            }
+            let raw = crate::mime_build::build_message(
+                &account.email,
+                &request.envelope_to,
+                &request.subject,
+                &request.text,
+                request.html.as_deref(),
+                &request.attachments,
+            )
+            .map_err(ApiError::bad_request)?;
+            let (message_id, queued) = send_raw(
+                app,
+                &account,
+                &request.envelope_from,
+                &request.envelope_to,
+                "Sent",
+                raw,
+            )
+            .await?;
+            send_proto(conn, 200, SendResponse { message_id, queued })
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))
         }
         _ => Err(ApiError::not_found("unknown endpoint")),
     }
+}
+
+async fn send_raw(
+    app: &App,
+    account: &Account,
+    envelope_from: &str,
+    envelope_to: &[String],
+    mailbox: &str,
+    raw: Vec<u8>,
+) -> Result<(String, bool), ApiError> {
+    let id = Uuid::new_v4().to_string();
+    let message = parse_message(&raw, account.id.clone(), mailbox, id.clone())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    app.db.append_message(message).await?;
+    let mut queued = false;
+    if let Some(outbound) = app.outbound.as_ref() {
+        for recipient in envelope_to {
+            let mut job = crate::outbound::OutboundQueue::job(
+                envelope_from.to_string(),
+                recipient.clone(),
+                raw.clone(),
+            );
+            job.message_id = id.clone();
+            if app.registry.account(recipient).is_none() && outbound.enqueue(job) {
+                queued = true;
+            }
+        }
+    }
+    for recipient in envelope_to {
+        if let Some(target) = app.registry.account(recipient) {
+            if target.id != account.id {
+                let copy =
+                    parse_message(&raw, target.id.clone(), "INBOX", Uuid::new_v4().to_string())
+                        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                app.db.append_message(copy).await?;
+            }
+        }
+    }
+    Ok((id, queued))
+}
+
+async fn send_attachment(
+    conn: &mut BufferedConn,
+    attachment: &tide_core::Attachment,
+) -> std::io::Result<()> {
+    let filename = attachment
+        .filename
+        .chars()
+        .filter(|ch| !matches!(ch, '"' | '\\' | '\r' | '\n'))
+        .collect::<String>();
+    let content_type = if attachment.content_type.is_empty() {
+        "application/octet-stream"
+    } else {
+        &attachment.content_type
+    };
+    let content_type = content_type
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '+' | '-' | '.'))
+        .collect::<String>();
+    let content_type = if content_type.is_empty() {
+        "application/octet-stream"
+    } else {
+        &content_type
+    };
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        attachment.data.len()
+    );
+    conn.write_all(headers.as_bytes()).await?;
+    conn.write_all(&attachment.data).await
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
 }
 
 fn ensure_account(account: &Account, requested: &str) -> Result<(), ApiError> {

@@ -50,6 +50,9 @@ sync_addr = "127.0.0.1:9093"
 token_ttl_hours = 168
 outbound_enabled = false
 outbound_tls = true
+dsn_enabled = true
+mta_sts = true
+dane = false
 admin_token = "change-admin-token"
 
 [tls]
@@ -59,6 +62,11 @@ self_signed = true
 enabled = true
 reject_spf_fail = false
 reject_dmarc_fail = false
+
+[spam]
+enabled = true
+threshold = 5.0
+reject_threshold = 15.0
 
 [dkim]
 # domain = "mail.local"
@@ -144,6 +152,12 @@ with smtplib.SMTP("127.0.0.1", 2525) as smtp:
 - server push через `WATCH`.
 
 Подробности: [docs/sync.md](docs/sync.md).
+
+## Эксплуатация
+
+- [Конфигурация](docs/configuration.md)
+- [Аудит безопасности](docs/security.md)
+- [Аудит производительности](docs/performance.md)
 
 ## Тесты
 
