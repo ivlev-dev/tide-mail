@@ -704,6 +704,40 @@ impl Db {
         futures::executor::block_on(self.append_messages(messages))
     }
 
+    pub async fn append_messages_fast(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<Vec<Receipt>, StoreError> {
+        let mut groups: HashMap<String, Vec<Message>> = HashMap::new();
+        for message in messages {
+            message.validate()?;
+            groups
+                .entry(message.account_id.clone())
+                .or_default()
+                .push(message);
+        }
+        let mut receipts = Vec::new();
+        for (account_id, mut messages) in groups {
+            while !messages.is_empty() {
+                let chunk = messages
+                    .drain(..messages.len().min(1000))
+                    .collect::<Vec<_>>();
+                let mut records = Vec::with_capacity(chunk.len());
+                let mut decoded = Vec::with_capacity(chunk.len());
+                for message in chunk {
+                    let payload = message.encode()?;
+                    records.push(Record::message(message.id.clone(), payload));
+                    decoded.push(Some(message));
+                }
+                receipts.push(
+                    self.append_prepared_inner(&account_id, NewBatch::new(records), decoded, false)
+                        .await?,
+                );
+            }
+        }
+        Ok(receipts)
+    }
+
     pub async fn append_batch(
         &self,
         account_id: &str,
