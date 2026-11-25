@@ -189,7 +189,10 @@ impl<S: Read + Write> SmtpClient<S> {
                 return Err(SmtpError::Protocol("reply line too long".into()));
             }
         }
-        while bytes.last().is_some_and(|byte| *byte == b'\n' || *byte == b'\r') {
+        while bytes
+            .last()
+            .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+        {
             bytes.pop();
         }
         Ok(String::from_utf8_lossy(&bytes).to_string())
@@ -266,7 +269,11 @@ mod tests {
         ]));
         assert_eq!(client.read_reply().unwrap().code, 220);
         let reply = client
-            .send_message("a@example.com", &["b@example.com".into()], b".hello\r\nworld")
+            .send_message(
+                "a@example.com",
+                &["b@example.com".into()],
+                b".hello\r\nworld",
+            )
             .unwrap();
         assert_eq!(reply.code, 250);
         let output = String::from_utf8_lossy(&client.stream().output);

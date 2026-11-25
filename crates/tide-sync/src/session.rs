@@ -3,8 +3,8 @@ use std::sync::Arc;
 use silent_protocol::SilentProto;
 use tide_proto::{
     BlobRequest, Cursor, ErrorResponse, Frame, SyncAck, SyncAuth, SyncAuthOk, SyncHello,
-    SyncHelloOk, SyncPing, SyncPong, SyncPull, SyncPush, SyncWatch,
-    capability, error_code, frame::kind, sync::SyncError as SyncErrorPayload,
+    SyncHelloOk, SyncPing, SyncPong, SyncPull, SyncPush, SyncWatch, capability, error_code,
+    frame::kind, sync::SyncError as SyncErrorPayload,
 };
 
 use crate::SyncError;
@@ -137,7 +137,7 @@ impl ServerSession {
                 let changes = self.backend.pull(
                     &account_id,
                     request.cursor,
-                    request.limit.max(1).min(500),
+                    request.limit.clamp(1, 500),
                     request.mailbox.as_deref(),
                     request.include_deleted,
                     request.include_bodies,
@@ -150,11 +150,9 @@ impl ServerSession {
                 if request.account_id != account_id {
                     return Err(SyncError::Unauthorized("account mismatch".into()));
                 }
-                let result = self.backend.push(
-                    &account_id,
-                    &request.txn_id,
-                    request.operations,
-                )?;
+                let result = self
+                    .backend
+                    .push(&account_id, &request.txn_id, request.operations)?;
                 self.cursor = result.cursor;
                 Ok(vec![Frame::new(kind::PUSH_OK, result.encode()?)])
             }
@@ -173,14 +171,9 @@ impl ServerSession {
                 if request.account_id != account_id {
                     return Err(SyncError::Unauthorized("account mismatch".into()));
                 }
-                let changes = self.backend.pull(
-                    &account_id,
-                    request.cursor,
-                    1,
-                    None,
-                    false,
-                    false,
-                )?;
+                let changes =
+                    self.backend
+                        .pull(&account_id, request.cursor, 1, None, false, false)?;
                 if let Some(change) = changes.changes.first() {
                     let event = tide_proto::SyncEvent {
                         cursor: changes.next_cursor,

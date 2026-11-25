@@ -1,12 +1,13 @@
 use silent_protocol::SilentProto;
 use tide_proto::{
-    BlobChunk, BlobRequest, Cursor, ErrorResponse, Frame, SyncAck, SyncAuth, SyncAuthOk, SyncChanges,
-    SyncEvent, SyncHello, SyncHelloOk, SyncPing, SyncPong, SyncPull, SyncPush, SyncPushResult,
-    SyncWatch, frame::kind, sync::SyncError as SyncErrorPayload,
+    BlobChunk, BlobRequest, Cursor, ErrorResponse, Frame, SyncAck, SyncAuth, SyncAuthOk,
+    SyncChanges, SyncEvent, SyncHello, SyncHelloOk, SyncPing, SyncPong, SyncPull, SyncPush,
+    SyncPushResult, SyncWatch, frame::kind, sync::SyncError as SyncErrorPayload,
 };
 
 use crate::SyncError;
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientEvent {
     Hello(SyncHelloOk),

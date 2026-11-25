@@ -11,16 +11,11 @@ use crate::batch::{DecodedBatch, NewBatch, encode_batch};
 use crate::error::StoreError;
 use crate::format::{LANE_HEADER_SIZE, LaneHeader, MAX_BATCH_SIZE};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Durability {
     None,
+    #[default]
     DataSync,
-}
-
-impl Default for Durability {
-    fn default() -> Self {
-        Self::DataSync
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +119,11 @@ pub(crate) fn spawn_lane(
     let thread_name = format!("tide-lane-{lane_id}");
     let join = std::thread::Builder::new()
         .name(thread_name)
-        .spawn(move || run_lane(lane_id, file, base, capacity, head, seq, durability, rx, init_tx))
+        .spawn(move || {
+            run_lane(
+                lane_id, file, base, capacity, head, seq, durability, rx, init_tx,
+            )
+        })
         .map_err(StoreError::Io)?;
     match init_rx.recv() {
         Ok(Ok(())) => {}
@@ -159,6 +158,7 @@ struct LaneState {
     ring: IoUring,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_lane(
     lane_id: u16,
     file: Arc<File>,
@@ -248,10 +248,7 @@ impl LaneState {
     }
 }
 
-fn persist_lane_header(
-    file: &File,
-    state: &LaneState,
-) -> Result<(), StoreError> {
+fn persist_lane_header(file: &File, state: &LaneState) -> Result<(), StoreError> {
     let header = LaneHeader {
         lane_id: state.lane_id,
         capacity: state.capacity,
@@ -389,14 +386,23 @@ mod tests {
         )
         .unwrap();
         let receipt = writer
-            .append_blocking(NewBatch::single(crate::batch::Record::note("key", vec![1, 2, 3])))
+            .append_blocking(NewBatch::single(crate::batch::Record::note(
+                "key",
+                vec![1, 2, 3],
+            )))
             .unwrap();
         assert_eq!(receipt.seq, 1);
         assert!(receipt.durable);
         drop(writer);
         let bytes = std::fs::read(&path).unwrap();
-        let (head, seq, batches) =
-            replay_lane(&bytes, 0, LANE_HEADER_SIZE + 1024 * 1024, LANE_HEADER_SIZE, 1).unwrap();
+        let (head, seq, batches) = replay_lane(
+            &bytes,
+            0,
+            LANE_HEADER_SIZE + 1024 * 1024,
+            LANE_HEADER_SIZE,
+            1,
+        )
+        .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(head, receipt.offset + receipt.total_len);
         assert_eq!(seq, 2);

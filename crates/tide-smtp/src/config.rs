@@ -12,7 +12,7 @@ impl AuthMechanism {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse_mechanism(value: &str) -> Option<Self> {
         match value.to_ascii_uppercase().as_str() {
             "PLAIN" => Some(Self::Plain),
             "LOGIN" => Some(Self::Login),

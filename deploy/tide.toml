@@ -1,0 +1,22 @@
+[server]
+hostname = "mail.local"
+data_path = "/data/mail.tide"
+data_lanes = 8
+lane_capacity_mb = 512
+workers = 2
+http_addr = "0.0.0.0:8080"
+smtp_addr = "0.0.0.0:2525"
+submission_addr = "0.0.0.0:5870"
+sync_addr = "0.0.0.0:9093"
+token_ttl_hours = 168
+outbound_enabled = false
+
+[tls]
+self_signed = true
+# cert_path = "/etc/tide/fullchain.pem"
+# key_path = "/etc/tide/privkey.pem"
+
+[[accounts]]
+email = "alice@mail.local"
+password = "change-me"
+name = "Alice"

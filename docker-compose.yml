@@ -1,0 +1,22 @@
+services:
+  tide:
+    build: .
+    command: ["/etc/tide/tide.toml"]
+    ports:
+      - "8080:8080"
+      - "2525:2525"
+      - "5870:5870"
+      - "9093:9093"
+    volumes:
+      - ./deploy:/etc/tide:ro
+      - tide-data:/data
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    restart: unless-stopped
+
+volumes:
+  tide-data:

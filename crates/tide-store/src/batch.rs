@@ -2,9 +2,9 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use crate::error::StoreError;
 use crate::format::{
-    BATCH_ALIGN, BATCH_FOOTER_SIZE, BATCH_HEADER_SIZE, MAGIC_BATCH, MAGIC_FOOTER,
-    MAGIC_RECORD, MAX_BATCH_SIZE, MAX_RECORDS_PER_BATCH, PROTOCOL_VERSION, RECORD_HEADER_SIZE,
-    align_up, read_u32, read_u64, write_u32, write_u64,
+    BATCH_ALIGN, BATCH_FOOTER_SIZE, BATCH_HEADER_SIZE, MAGIC_BATCH, MAGIC_FOOTER, MAGIC_RECORD,
+    MAX_BATCH_SIZE, MAX_RECORDS_PER_BATCH, PROTOCOL_VERSION, RECORD_HEADER_SIZE, align_up,
+    read_u32, read_u64, write_u32, write_u64,
 };
 
 pub const KIND_MESSAGE: u16 = 1;
@@ -97,11 +97,7 @@ struct BatchHeaderFields {
     record_count: u32,
 }
 
-pub fn encode_batch(
-    lane_id: u16,
-    seq: u64,
-    batch: &NewBatch,
-) -> Result<Vec<u8>, StoreError> {
+pub fn encode_batch(lane_id: u16, seq: u64, batch: &NewBatch) -> Result<Vec<u8>, StoreError> {
     if batch.records.is_empty() {
         return Err(StoreError::invalid_batch("empty batch"));
     }
@@ -265,16 +261,16 @@ fn encode_record(record: &Record, out: &mut Vec<u8>) -> Result<(), StoreError> {
     }
 
     let key = record.key.as_bytes();
-    let key_len = u32::try_from(key.len())
-        .map_err(|_| StoreError::invalid_batch("record key too long"))?;
+    let key_len =
+        u32::try_from(key.len()).map_err(|_| StoreError::invalid_batch("record key too long"))?;
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| StoreError::invalid_batch("record payload too long"))?;
     let record_len = RECORD_HEADER_SIZE
         .checked_add(key.len())
         .and_then(|value| value.checked_add(payload.len()))
         .ok_or_else(|| StoreError::invalid_batch("record length overflow"))?;
-    let record_len = u32::try_from(record_len)
-        .map_err(|_| StoreError::invalid_batch("record too large"))?;
+    let record_len =
+        u32::try_from(record_len).map_err(|_| StoreError::invalid_batch("record too large"))?;
 
     let start = out.len();
     out.resize(start + RECORD_HEADER_SIZE, 0);

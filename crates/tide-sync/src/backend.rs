@@ -41,12 +41,7 @@ pub trait SyncBackend: Send + Sync {
 }
 
 pub trait SyncAuth: Send + Sync {
-    fn authenticate(
-        &self,
-        account_id: &str,
-        token: &str,
-        device_id: &str,
-    ) -> Result<(), String>;
+    fn authenticate(&self, account_id: &str, token: &str, device_id: &str) -> Result<(), String>;
 }
 
 #[derive(Default)]
@@ -291,13 +286,12 @@ impl SyncBackend for InMemoryBackend {
             .blobs
             .get(&key)
             .ok_or_else(|| SyncError::Backend("blob not found".into()))?;
-        let start = usize::try_from(offset).map_err(|_| SyncError::Backend("offset overflow".into()))?;
+        let start =
+            usize::try_from(offset).map_err(|_| SyncError::Backend("offset overflow".into()))?;
         if start > data.len() {
             return Err(SyncError::Backend("offset out of range".into()));
         }
-        let end = start
-            .saturating_add(length as usize)
-            .min(data.len());
+        let end = start.saturating_add(length as usize).min(data.len());
         Ok(BlobChunk {
             message_id: message_id.to_string(),
             attachment_id: attachment_id.to_string(),

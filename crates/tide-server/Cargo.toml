@@ -1,0 +1,38 @@
+[package]
+name = "tide-server"
+description = "io_uring powered Tide Mail server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tide"
+path = "src/main.rs"
+
+[dependencies]
+argon2 = "0.5"
+futures.workspace = true
+httparse = "1"
+monoio = { version = "0.2", features = ["macros", "sync"] }
+monoio-rustls = "0.4"
+parking_lot.workspace = true
+rcgen = "0.14"
+rustls = "0.23"
+rustls-pemfile = "2"
+rand_core.workspace = true
+serde = { version = "1", features = ["derive"] }
+silent-protocol.workspace = true
+thiserror.workspace = true
+tide-core = { path = "../tide-core" }
+tide-proto = { path = "../tide-proto" }
+tide-smtp = { path = "../tide-smtp" }
+tide-store = { path = "../tide-store" }
+tide-sync = { path = "../tide-sync" }
+toml = "0.8"
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

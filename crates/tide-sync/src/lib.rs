@@ -13,32 +13,27 @@ mod tests {
     use std::sync::Arc;
 
     use silent_protocol::SilentProto;
-    use tide_proto::{
-        Cursor, MessageMeta, SyncOperation, change_kind, op_kind,
-    };
+    use tide_proto::{Cursor, MessageMeta, SyncOperation, change_kind, op_kind};
 
     use super::*;
 
-    fn setup() -> (
-        ServerSession,
-        ClientSession,
-        Arc<InMemoryBackend>,
-        String,
-    ) {
+    fn setup() -> (ServerSession, ClientSession, Arc<InMemoryBackend>, String) {
         let backend = Arc::new(InMemoryBackend::new());
-        let server = ServerSession::new(
-            backend.clone(),
-            Arc::new(AllowAllAuth),
-            "tide-server",
-        );
+        let server = ServerSession::new(backend.clone(), Arc::new(AllowAllAuth), "tide-server");
         let (client, hello) = ClientSession::new("device-1", "test");
         let mut server = server;
         let mut client = client;
         let frames = server.handle(hello);
-        assert_eq!(client.handle(frames[0].clone()).unwrap().class_name(), "hello");
+        assert_eq!(
+            client.handle(frames[0].clone()).unwrap().class_name(),
+            "hello"
+        );
         let auth = client.auth_frame("alice", "token", "device-1").unwrap();
         let frames = server.handle(auth);
-        assert_eq!(client.handle(frames[0].clone()).unwrap().class_name(), "auth");
+        assert_eq!(
+            client.handle(frames[0].clone()).unwrap().class_name(),
+            "auth"
+        );
         backend
             .seed_message(
                 "alice",

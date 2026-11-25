@@ -1,3 +1,7 @@
+pub mod mime;
+
+pub use mime::{MimeError, parse_message};
+
 use silent_protocol::SilentProto;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
@@ -93,4 +97,23 @@ impl Message {
         }
         Ok(())
     }
+}
+
+pub fn thread_subject(subject: &str) -> String {
+    let mut value = subject.trim();
+    loop {
+        let lower = value.to_ascii_lowercase();
+        let mut stripped = false;
+        for prefix in ["re:", "fw:", "fwd:", "aw:", "sv:"] {
+            if let Some(rest) = lower.strip_prefix(prefix) {
+                value = value[value.len() - rest.len()..].trim();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    value.to_ascii_lowercase()
 }

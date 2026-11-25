@@ -66,8 +66,7 @@ impl Command {
 }
 
 pub fn parse_command(line: &[u8]) -> Result<Command, String> {
-    let line = std::str::from_utf8(line)
-        .map_err(|_| "команда должна быть в UTF-8".to_string())?;
+    let line = std::str::from_utf8(line).map_err(|_| "команда должна быть в UTF-8".to_string())?;
     let line = line.trim_end_matches(['\r', '\n']);
     let line = line.trim_start();
     if line.is_empty() {
@@ -92,15 +91,15 @@ pub fn parse_command(line: &[u8]) -> Result<Command, String> {
         }
         "MAIL" => {
             let rest = rest.trim();
-            let rest = strip_prefix_ci(rest, "FROM:")
-                .ok_or_else(|| "MAIL требует FROM:".to_string())?;
+            let rest =
+                strip_prefix_ci(rest, "FROM:").ok_or_else(|| "MAIL требует FROM:".to_string())?;
             let (from, params) = parse_path_and_params(rest)?;
             Ok(Command::Mail(MailCommand { from, params }))
         }
         "RCPT" => {
             let rest = rest.trim();
-            let rest = strip_prefix_ci(rest, "TO:")
-                .ok_or_else(|| "RCPT требует TO:".to_string())?;
+            let rest =
+                strip_prefix_ci(rest, "TO:").ok_or_else(|| "RCPT требует TO:".to_string())?;
             let (to, params) = parse_path_and_params(rest)?;
             Ok(Command::Rcpt(RcptCommand { to, params }))
         }
@@ -116,10 +115,7 @@ pub fn parse_command(line: &[u8]) -> Result<Command, String> {
                 .ok_or_else(|| "AUTH требует механизм".to_string())?
                 .to_ascii_uppercase();
             let initial = parts.next().map(str::to_string);
-            Ok(Command::Auth {
-                mechanism,
-                initial,
-            })
+            Ok(Command::Auth { mechanism, initial })
         }
         "VRFY" => Ok(Command::Vrfy(rest.trim().to_string())),
         "HELP" => Ok(Command::Help(if rest.trim().is_empty() {
@@ -132,7 +128,7 @@ pub fn parse_command(line: &[u8]) -> Result<Command, String> {
 }
 
 fn split_verb(line: &str) -> (&str, &str) {
-    match line.find(|character: char| character == ' ' || character == '\t') {
+    match line.find([' ', '\t']) {
         Some(index) => (&line[..index], &line[index..]),
         None => (line, ""),
     }
@@ -149,9 +145,9 @@ fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-fn parse_path_and_params(
-    value: &str,
-) -> Result<(String, Vec<(String, Option<String>)>), String> {
+type Params = Vec<(String, Option<String>)>;
+
+fn parse_path_and_params(value: &str) -> Result<(String, Params), String> {
     let value = value.trim_start();
     let (path, rest) = if let Some(stripped) = value.strip_prefix('<') {
         let end = stripped

@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::batch::{
     DecodedBatch, KIND_DELETE, KIND_FLAGS, KIND_MESSAGE, KIND_MOVE, NewBatch, Record, decode_batch,
 };
+use crate::change::{ChangeEntry, ChangesPage, SyncCursor, kind as change_kind};
 use crate::error::StoreError;
 use crate::format::{
     DEFAULT_DATA_LANES, DEFAULT_LANE_CAPACITY, FIRST_DATA_LANE, FORMAT_VERSION, LANE_HEADER_SIZE,
@@ -87,6 +88,19 @@ struct Location {
     record_index: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MailboxStats {
+    pub total: u64,
+    pub unread: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountStats {
+    pub total: u64,
+    pub unread: u64,
+    pub mailboxes: HashMap<String, MailboxStats>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreStats {
     pub path: PathBuf,
@@ -105,6 +119,8 @@ struct DbInner {
     lanes: Vec<LaneWriter>,
     index: RwLock<SearchIndex>,
     catalog: RwLock<HashMap<String, Location>>,
+    changes: RwLock<HashMap<String, Vec<ChangeEntry>>>,
+    lane_locks: Vec<Arc<futures::lock::Mutex<()>>>,
 }
 
 #[derive(Clone)]
@@ -164,9 +180,9 @@ impl Db {
 
         let mut index = SearchIndex::new();
         let mut catalog = HashMap::new();
+        let mut changes = HashMap::new();
         let mut lanes = Vec::with_capacity(superblock.lane_count as usize);
-        let mut init_ring =
-            io_uring::IoUring::new(8).map_err(StoreError::Io)?;
+        let mut init_ring = io_uring::IoUring::new(8).map_err(StoreError::Io)?;
 
         for lane_id in 0..superblock.lane_count {
             let base = lane_base(&superblock, lane_id)?;
@@ -182,6 +198,7 @@ impl Db {
                     offset,
                     &mut index,
                     &mut catalog,
+                    &mut changes,
                 )?;
                 offset += batch.total_len;
             }
@@ -213,6 +230,9 @@ impl Db {
         }
 
         let generation = superblock.generation;
+        let lane_locks = (0..superblock.lane_count)
+            .map(|_| Arc::new(futures::lock::Mutex::new(())))
+            .collect();
         let inner = DbInner {
             path,
             mmap,
@@ -222,6 +242,8 @@ impl Db {
             lanes,
             index: RwLock::new(index),
             catalog: RwLock::new(catalog),
+            changes: RwLock::new(changes),
+            lane_locks,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -271,11 +293,14 @@ impl Db {
         validate_batch(account_id, &batch)?;
         let records = batch.records.clone();
         let lane = self.lane_for_account(account_id);
+        let lock = self.inner.lane_locks[lane.lane_id() as usize].clone();
+        let _guard = lock.lock().await;
         let receipt = lane.append(batch).await?;
         self.apply_committed_records(
             receipt.lane_id,
             receipt.offset,
             receipt.total_len,
+            receipt.seq,
             &records,
         )?;
         Ok(receipt)
@@ -326,6 +351,75 @@ impl Db {
         self.inner.index.read().len()
     }
 
+    pub fn account_stats(&self, account_id: &str) -> AccountStats {
+        let index = self.inner.index.read();
+        let mut stats = AccountStats::default();
+        for doc in index.iter().filter(|doc| doc.account_id == account_id) {
+            stats.total += 1;
+            if doc.flags & tide_core::flags::SEEN == 0 {
+                stats.unread += 1;
+            }
+            let mailbox = stats.mailboxes.entry(doc.mailbox.clone()).or_default();
+            mailbox.total += 1;
+            if doc.flags & tide_core::flags::SEEN == 0 {
+                mailbox.unread += 1;
+            }
+        }
+        stats
+    }
+
+    pub fn sync_cursor(&self, account_id: &str) -> SyncCursor {
+        let lane = self.lane_for_account(account_id).lane_id();
+        let seq = self
+            .inner
+            .changes
+            .read()
+            .get(account_id)
+            .and_then(|entries| entries.last())
+            .map_or(0, |entry| entry.seq);
+        SyncCursor { lane, seq }
+    }
+
+    pub fn sync_changes(&self, account_id: &str, since_seq: u64, limit: u32) -> ChangesPage {
+        let changes = self.inner.changes.read();
+        let entries = match changes.get(account_id) {
+            Some(entries) => entries,
+            None => {
+                return ChangesPage {
+                    entries: Vec::new(),
+                    next_seq: since_seq,
+                    has_more: false,
+                };
+            }
+        };
+        let limit = limit.max(1) as usize;
+        let mut selected = Vec::new();
+        let mut next_seq = since_seq;
+        let mut has_more = false;
+        for entry in entries.iter().filter(|entry| entry.seq > since_seq) {
+            if selected.len() >= limit {
+                has_more = true;
+                break;
+            }
+            next_seq = entry.seq;
+            selected.push(entry.clone());
+        }
+        ChangesPage {
+            entries: selected,
+            next_seq,
+            has_more,
+        }
+    }
+
+    pub fn all_changes(&self, account_id: &str) -> Vec<ChangeEntry> {
+        self.inner
+            .changes
+            .read()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub async fn delete_message(&self, id: &str) -> Result<Receipt, StoreError> {
         let location = self.location(id)?;
         let lane = self
@@ -334,6 +428,8 @@ impl Db {
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
+        let lock = self.inner.lane_locks[lane.lane_id() as usize].clone();
+        let _guard = lock.lock().await;
         let receipt = lane.append(NewBatch::single(Record::delete(id))).await?;
         self.inner.index.write().delete(id);
         self.inner.catalog.write().remove(id);
@@ -348,6 +444,8 @@ impl Db {
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
+        let lock = self.inner.lane_locks[lane.lane_id() as usize].clone();
+        let _guard = lock.lock().await;
         let receipt = lane
             .append(NewBatch::single(Record::flags(id, flags)))
             .await?;
@@ -368,17 +466,15 @@ impl Db {
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
+        let lock = self.inner.lane_locks[lane.lane_id() as usize].clone();
+        let _guard = lock.lock().await;
         let payload = MovePayload {
             account_id: account_id.to_string(),
             mailbox: mailbox.to_string(),
         }
         .encode()?;
         let receipt = lane
-            .append(NewBatch::single(Record::new(
-                KIND_MOVE,
-                id,
-                payload,
-            )))
+            .append(NewBatch::single(Record::new(KIND_MOVE, id, payload)))
             .await?;
         self.inner
             .index
@@ -408,14 +504,17 @@ impl Db {
         lane_id: u16,
         batch_offset: u64,
         batch_len: u64,
+        seq: u64,
         records: &[Record],
     ) -> Result<(), StoreError> {
         let mut index = self.inner.index.write();
         let mut catalog = self.inner.catalog.write();
+        let mut changes = self.inner.changes.write();
         for (record_index, record) in records.iter().enumerate() {
             match record.kind {
                 KIND_MESSAGE => {
                     let message = Message::decode(&record.payload)?;
+                    push_change(&mut changes, ChangeEntry::from_message(seq, &message));
                     index.insert(&message);
                     catalog.insert(
                         record.key.clone(),
@@ -428,17 +527,33 @@ impl Db {
                     );
                 }
                 KIND_DELETE => {
+                    if let Some(doc) = index.get(&record.key) {
+                        push_change(
+                            &mut changes,
+                            ChangeEntry::from_doc(seq, change_kind::DELETE, doc),
+                        );
+                    }
                     index.delete(&record.key);
                     catalog.remove(&record.key);
                 }
                 KIND_FLAGS => {
                     if let Some(flags) = decode_flags(&record.payload) {
                         index.update_flags(&record.key, flags);
+                        if let Some(doc) = index.get(&record.key) {
+                            let mut entry = ChangeEntry::from_doc(seq, change_kind::FLAGS, doc);
+                            entry.flags = flags;
+                            push_change(&mut changes, entry);
+                        }
                     }
                 }
                 KIND_MOVE => {
                     let payload = MovePayload::decode(&record.payload)?;
                     index.move_message(&record.key, &payload.account_id, &payload.mailbox);
+                    if let Some(doc) = index.get(&record.key) {
+                        let mut entry = ChangeEntry::from_doc(seq, change_kind::MOVE, doc);
+                        entry.mailbox = payload.mailbox.clone();
+                        push_change(&mut changes, entry);
+                    }
                 }
                 _ => {}
             }
@@ -503,13 +618,7 @@ fn initialize_file(file: &File, options: &StoreOptions) -> Result<(), StoreError
             checkpoint_seq: 0,
             checkpoint_head: base + LANE_HEADER_SIZE,
         };
-        write_all_at(
-            &mut ring,
-            file.as_raw_fd(),
-            &header.encode(),
-            base,
-            true,
-        )?;
+        write_all_at(&mut ring, file.as_raw_fd(), &header.encode(), base, true)?;
     }
     let bytes = superblock.encode();
     write_all_at(
@@ -581,11 +690,14 @@ fn apply_batch_to_maps(
     offset: u64,
     index: &mut SearchIndex,
     catalog: &mut HashMap<String, Location>,
+    changes: &mut HashMap<String, Vec<ChangeEntry>>,
 ) -> Result<(), StoreError> {
+    let seq = batch.seq;
     for (record_index, record) in batch.records.iter().enumerate() {
         match record.kind {
             KIND_MESSAGE => {
                 let message = Message::decode(&record.payload)?;
+                push_change(changes, ChangeEntry::from_message(seq, &message));
                 index.insert(&message);
                 catalog.insert(
                     record.key.clone(),
@@ -598,22 +710,45 @@ fn apply_batch_to_maps(
                 );
             }
             KIND_DELETE => {
+                if let Some(doc) = index.get(&record.key) {
+                    push_change(
+                        changes,
+                        ChangeEntry::from_doc(seq, change_kind::DELETE, doc),
+                    );
+                }
                 index.delete(&record.key);
                 catalog.remove(&record.key);
             }
             KIND_FLAGS => {
                 if let Some(flags) = decode_flags(&record.payload) {
                     index.update_flags(&record.key, flags);
+                    if let Some(doc) = index.get(&record.key) {
+                        let mut entry = ChangeEntry::from_doc(seq, change_kind::FLAGS, doc);
+                        entry.flags = flags;
+                        push_change(changes, entry);
+                    }
                 }
             }
             KIND_MOVE => {
                 let payload = MovePayload::decode(&record.payload)?;
                 index.move_message(&record.key, &payload.account_id, &payload.mailbox);
+                if let Some(doc) = index.get(&record.key) {
+                    let mut entry = ChangeEntry::from_doc(seq, change_kind::MOVE, doc);
+                    entry.mailbox = payload.mailbox.clone();
+                    push_change(changes, entry);
+                }
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+fn push_change(changes: &mut HashMap<String, Vec<ChangeEntry>>, entry: ChangeEntry) {
+    changes
+        .entry(entry.account_id.clone())
+        .or_default()
+        .push(entry);
 }
 
 fn validate_batch(account_id: &str, batch: &NewBatch) -> Result<(), StoreError> {
@@ -767,8 +902,7 @@ mod tests {
         let db = Db::open(&path, options()).unwrap();
         db.append_message_blocking(message("1", "alice", "Hello", "world"))
             .unwrap();
-        futures::executor::block_on(db.update_flags("1", flags::SEEN))
-            .unwrap();
+        futures::executor::block_on(db.update_flags("1", flags::SEEN)).unwrap();
         assert!(db.get_message("1").unwrap().unwrap().is_read());
         futures::executor::block_on(db.delete_message("1")).unwrap();
         assert!(db.get_message("1").unwrap().is_none());
@@ -777,6 +911,31 @@ mod tests {
         let db = Db::open(&path, options()).unwrap();
         assert!(db.get_message("1").unwrap().is_none());
         assert_eq!(db.index_size(), 0);
+    }
+
+    #[test]
+    fn sync_changes_are_incremental() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.tide");
+        let db = Db::open(&path, options()).unwrap();
+        db.append_message_blocking(message("1", "alice", "Hello", "world"))
+            .unwrap();
+        let cursor = db.sync_cursor("alice");
+        assert_eq!(cursor.seq, 1);
+        let page = db.sync_changes("alice", 0, 10);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].subject, "Hello");
+        assert_eq!(page.next_seq, 1);
+        db.append_message_blocking(message("2", "alice", "Second", "body"))
+            .unwrap();
+        let page = db.sync_changes("alice", page.next_seq, 10);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].message_id, "2");
+        drop(db);
+        let db = Db::open(&path, options()).unwrap();
+        let page = db.sync_changes("alice", 0, 10);
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(db.sync_cursor("alice").seq, 2);
     }
 
     #[test]

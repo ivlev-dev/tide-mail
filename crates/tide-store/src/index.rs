@@ -99,6 +99,13 @@ pub struct Doc {
     pub subject: String,
     pub from: String,
     pub to: String,
+    pub cc: String,
+    pub from_addresses: Vec<tide_core::Address>,
+    pub to_addresses: Vec<tide_core::Address>,
+    pub cc_addresses: Vec<tide_core::Address>,
+    pub thread_id: String,
+    pub message_id_header: String,
+    pub size: u64,
     pub date: i64,
     pub flags: u64,
     pub body: String,
@@ -135,6 +142,24 @@ impl From<&Message> for Doc {
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
+            cc: message
+                .cc
+                .iter()
+                .map(|address| {
+                    if let Some(name) = &address.name {
+                        format!("{name} <{}>", address.email)
+                    } else {
+                        address.email.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            from_addresses: message.from.clone(),
+            to_addresses: message.to.clone(),
+            cc_addresses: message.cc.clone(),
+            thread_id: message.thread_id.clone(),
+            message_id_header: message.message_id.clone(),
+            size: message.size,
             date: message.date,
             flags: message.flags,
             body: message.body_text.clone(),
@@ -247,11 +272,7 @@ impl SearchIndex {
     pub fn get(&self, id: &str) -> Option<&Doc> {
         let doc_id = self.by_id.get(id)?;
         let slot = self.slots.get(*doc_id as usize)?;
-        if slot.deleted {
-            None
-        } else {
-            Some(&slot.doc)
-        }
+        if slot.deleted { None } else { Some(&slot.doc) }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Doc> {
@@ -365,10 +386,9 @@ impl SearchIndex {
                 let mut value = 0.0;
                 for (source, term) in &scored_terms {
                     let (tf, weight) = match source {
-                        TermSource::Subject => (
-                            tf(&self.subject_terms, term, doc_id),
-                            SUBJECT_WEIGHT,
-                        ),
+                        TermSource::Subject => {
+                            (tf(&self.subject_terms, term, doc_id), SUBJECT_WEIGHT)
+                        }
                         TermSource::Body => (tf(&self.body_terms, term, doc_id), BODY_WEIGHT),
                         TermSource::From => (tf(&self.from_terms, term, doc_id), FROM_WEIGHT),
                         TermSource::Text => (
@@ -474,25 +494,23 @@ fn collect_docs(map: &HashMap<String, Vec<Posting>>, term: &str, out: &mut HashS
 }
 
 fn make_snippet(doc: &Doc, terms: &[(TermSource, String)]) -> String {
-    let needle = terms
-        .iter()
-        .find_map(|(source, term)| match source {
-            TermSource::Subject => {
-                if doc.subject.to_lowercase().contains(term) {
-                    Some(term.as_str())
-                } else {
-                    None
-                }
+    let needle = terms.iter().find_map(|(source, term)| match source {
+        TermSource::Subject => {
+            if doc.subject.to_lowercase().contains(term) {
+                Some(term.as_str())
+            } else {
+                None
             }
-            TermSource::Body | TermSource::Text => {
-                if doc.body.to_lowercase().contains(term) {
-                    Some(term.as_str())
-                } else {
-                    None
-                }
+        }
+        TermSource::Body | TermSource::Text => {
+            if doc.body.to_lowercase().contains(term) {
+                Some(term.as_str())
+            } else {
+                None
             }
-            TermSource::From => None,
-        });
+        }
+        TermSource::From => None,
+    });
     let Some(needle) = needle else {
         return truncate_chars(&doc.body, 180);
     };
@@ -506,7 +524,7 @@ fn make_snippet(doc: &Doc, terms: &[(TermSource, String)]) -> String {
     let end = char_to_byte(&doc.body, start_chars + 180);
     let mut snippet = doc.body[start..end].trim().to_string();
     if start > 0 {
-        snippet.insert_str(0, "…");
+        snippet.insert(0, '…');
     }
     if end < doc.body.len() {
         snippet.push('…');
@@ -568,23 +586,192 @@ fn russian_stemmer() -> &'static Stemmer {
 
 fn is_stopword(word: &str) -> bool {
     const WORDS: &[&str] = &[
-        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "he", "in",
-        "is", "it", "its", "of", "on", "that", "the", "to", "was", "were", "will", "with",
-        "this", "these", "those", "or", "not", "but", "you", "your", "we", "our", "и", "в",
-        "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то", "все", "она", "так",
-        "его", "но", "да", "ты", "к", "у", "же", "вы", "за", "бы", "по", "только", "ее",
-        "мне", "было", "вот", "от", "меня", "еще", "нет", "о", "из", "ему", "теперь",
-        "когда", "даже", "ну", "вдруг", "ли", "если", "уже", "или", "ни", "быть", "был",
-        "него", "до", "вас", "нибудь", "опять", "уж", "вам", "ведь", "там", "потом", "себя",
-        "ничего", "ей", "может", "они", "тут", "где", "есть", "надо", "ней", "для", "мы",
-        "тебя", "их", "чем", "была", "сам", "чтоб", "без", "будто", "чего", "раз", "тоже",
-        "себе", "под", "будет", "ж", "тогда", "кто", "этот", "того", "потому", "этого",
-        "какой", "совсем", "ним", "здесь", "этом", "один", "почти", "мой", "тем", "чтобы",
-        "нее", "сейчас", "были", "куда", "зачем", "всех", "никогда", "можно", "при",
-        "наконец", "два", "об", "другой", "хоть", "после", "над", "больше", "тот", "через",
-        "эти", "нас", "про", "всего", "них", "какая", "много", "разве", "три", "эту",
-        "моя", "впрочем", "хорошо", "свою", "этой", "перед", "иногда", "лучше", "чуть",
-        "том", "нельзя", "такой", "им", "более", "всегда", "конечно", "всю", "между",
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "he",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "that",
+        "the",
+        "to",
+        "was",
+        "were",
+        "will",
+        "with",
+        "this",
+        "these",
+        "those",
+        "or",
+        "not",
+        "but",
+        "you",
+        "your",
+        "we",
+        "our",
+        "и",
+        "в",
+        "во",
+        "не",
+        "что",
+        "он",
+        "на",
+        "я",
+        "с",
+        "со",
+        "как",
+        "а",
+        "то",
+        "все",
+        "она",
+        "так",
+        "его",
+        "но",
+        "да",
+        "ты",
+        "к",
+        "у",
+        "же",
+        "вы",
+        "за",
+        "бы",
+        "по",
+        "только",
+        "ее",
+        "мне",
+        "было",
+        "вот",
+        "от",
+        "меня",
+        "еще",
+        "нет",
+        "о",
+        "из",
+        "ему",
+        "теперь",
+        "когда",
+        "даже",
+        "ну",
+        "вдруг",
+        "ли",
+        "если",
+        "уже",
+        "или",
+        "ни",
+        "быть",
+        "был",
+        "него",
+        "до",
+        "вас",
+        "нибудь",
+        "опять",
+        "уж",
+        "вам",
+        "ведь",
+        "там",
+        "потом",
+        "себя",
+        "ничего",
+        "ей",
+        "может",
+        "они",
+        "тут",
+        "где",
+        "есть",
+        "надо",
+        "ней",
+        "для",
+        "мы",
+        "тебя",
+        "их",
+        "чем",
+        "была",
+        "сам",
+        "чтоб",
+        "без",
+        "будто",
+        "чего",
+        "раз",
+        "тоже",
+        "себе",
+        "под",
+        "будет",
+        "ж",
+        "тогда",
+        "кто",
+        "этот",
+        "того",
+        "потому",
+        "этого",
+        "какой",
+        "совсем",
+        "ним",
+        "здесь",
+        "этом",
+        "один",
+        "почти",
+        "мой",
+        "тем",
+        "чтобы",
+        "нее",
+        "сейчас",
+        "были",
+        "куда",
+        "зачем",
+        "всех",
+        "никогда",
+        "можно",
+        "при",
+        "наконец",
+        "два",
+        "об",
+        "другой",
+        "хоть",
+        "после",
+        "над",
+        "больше",
+        "тот",
+        "через",
+        "эти",
+        "нас",
+        "про",
+        "всего",
+        "них",
+        "какая",
+        "много",
+        "разве",
+        "три",
+        "эту",
+        "моя",
+        "впрочем",
+        "хорошо",
+        "свою",
+        "этой",
+        "перед",
+        "иногда",
+        "лучше",
+        "чуть",
+        "том",
+        "нельзя",
+        "такой",
+        "им",
+        "более",
+        "всегда",
+        "конечно",
+        "всю",
+        "между",
     ];
     WORDS.contains(&word)
 }

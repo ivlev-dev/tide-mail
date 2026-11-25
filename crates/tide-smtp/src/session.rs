@@ -69,10 +69,7 @@ pub struct SmtpSession {
 
 impl SmtpSession {
     pub fn new(config: SmtpConfig) -> (Self, Reply) {
-        let greeting = Reply::new(
-            220,
-            format!("{} ESMTP Tide Mail", config.hostname),
-        );
+        let greeting = Reply::new(220, format!("{} ESMTP Tide Mail", config.hostname));
         let session = Self {
             config,
             state: State::Command,
@@ -177,10 +174,7 @@ impl SmtpSession {
                     ))];
                 }
                 if self.envelope.is_some() {
-                    return vec![Action::Reply(Reply::new(
-                        503,
-                        "5.5.1 Nested MAIL command",
-                    ))];
+                    return vec![Action::Reply(Reply::new(503, "5.5.1 Nested MAIL command"))];
                 }
                 let size = match mail.param("SIZE").map(str::parse::<u64>) {
                     Some(Ok(value)) => Some(value),
@@ -226,10 +220,7 @@ impl SmtpSession {
             }
             Command::Rcpt(rcpt) => {
                 if self.envelope.is_none() {
-                    return vec![Action::Reply(Reply::new(
-                        503,
-                        "5.5.1 Send MAIL first",
-                    ))];
+                    return vec![Action::Reply(Reply::new(503, "5.5.1 Send MAIL first"))];
                 }
                 if rcpt.to.is_empty() {
                     return vec![Action::Reply(Reply::new(
@@ -239,26 +230,17 @@ impl SmtpSession {
                 }
                 let envelope = self.envelope.as_mut().expect("checked above");
                 if envelope.to.len() >= self.config.max_recipients {
-                    return vec![Action::Reply(Reply::new(
-                        452,
-                        "4.5.3 Too many recipients",
-                    ))];
+                    return vec![Action::Reply(Reply::new(452, "4.5.3 Too many recipients"))];
                 }
                 envelope.to.push(rcpt.to);
                 vec![Action::Reply(Reply::new(250, "2.1.5 Recipient accepted"))]
             }
             Command::Data => {
                 let Some(envelope) = &self.envelope else {
-                    return vec![Action::Reply(Reply::new(
-                        503,
-                        "5.5.1 Send MAIL first",
-                    ))];
+                    return vec![Action::Reply(Reply::new(503, "5.5.1 Send MAIL first"))];
                 };
                 if envelope.to.is_empty() {
-                    return vec![Action::Reply(Reply::new(
-                        503,
-                        "5.5.1 Send RCPT first",
-                    ))];
+                    return vec![Action::Reply(Reply::new(503, "5.5.1 Send RCPT first"))];
                 }
                 self.state = State::Data;
                 self.data.clear();
@@ -274,10 +256,7 @@ impl SmtpSession {
                 vec![Action::Reply(Reply::new(250, "2.0.0 Reset"))]
             }
             Command::Noop => vec![Action::Reply(Reply::new(250, "2.0.0 OK"))],
-            Command::Quit => vec![
-                Action::Reply(Reply::new(221, "2.0.0 Bye")),
-                Action::Close,
-            ],
+            Command::Quit => vec![Action::Reply(Reply::new(221, "2.0.0 Bye")), Action::Close],
             Command::StartTls => {
                 if !self.config.enable_starttls {
                     return vec![Action::Reply(Reply::new(
@@ -292,20 +271,14 @@ impl SmtpSession {
                     ))];
                 }
                 if self.helo.is_none() {
-                    return vec![Action::Reply(Reply::new(
-                        503,
-                        "5.5.1 Send EHLO first",
-                    ))];
+                    return vec![Action::Reply(Reply::new(503, "5.5.1 Send EHLO first"))];
                 }
                 vec![
                     Action::Reply(Reply::new(220, "2.0.0 Ready to start TLS")),
                     Action::StartTls,
                 ]
             }
-            Command::Auth {
-                mechanism,
-                initial,
-            } => self.start_auth(&mechanism, initial),
+            Command::Auth { mechanism, initial } => self.start_auth(&mechanism, initial),
             Command::Vrfy(_) => vec![Action::Reply(Reply::new(
                 252,
                 "2.5.2 Cannot verify user, but will accept message",
@@ -371,7 +344,7 @@ impl SmtpSession {
                 "5.7.11 Encryption required for requested authentication mechanism",
             ))];
         }
-        let Some(mechanism) = AuthMechanism::from_str(mechanism) else {
+        let Some(mechanism) = AuthMechanism::parse_mechanism(mechanism) else {
             return vec![Action::Reply(Reply::new(
                 504,
                 "5.5.4 Unrecognized authentication mechanism",
@@ -578,10 +551,7 @@ mod tests {
         let reply = &replies(&actions)[0];
         assert_eq!(reply.code, 250);
         assert!(reply.lines.iter().any(|line| line == "STARTTLS"));
-        assert!(reply
-            .lines
-            .iter()
-            .any(|line| line.starts_with("AUTH")));
+        assert!(reply.lines.iter().any(|line| line.starts_with("AUTH")));
         assert_eq!(session.helo(), Some("client.example"));
     }
 
@@ -589,8 +559,14 @@ mod tests {
     fn accepts_mail_transaction() {
         let mut session = session();
         session.feed_line(b"EHLO client");
-        assert_eq!(replies(&session.feed_line(b"MAIL FROM:<a@example.com>"))[0].code, 250);
-        assert_eq!(replies(&session.feed_line(b"RCPT TO:<b@example.com>"))[0].code, 250);
+        assert_eq!(
+            replies(&session.feed_line(b"MAIL FROM:<a@example.com>"))[0].code,
+            250
+        );
+        assert_eq!(
+            replies(&session.feed_line(b"RCPT TO:<b@example.com>"))[0].code,
+            250
+        );
         assert_eq!(replies(&session.feed_line(b"DATA"))[0].code, 354);
         assert!(session.feed_line(b"Subject: test").is_empty());
         assert!(session.feed_line(b"").is_empty());
@@ -681,9 +657,15 @@ mod tests {
     #[test]
     fn enforces_command_order() {
         let mut session = session();
-        assert_eq!(replies(&session.feed_line(b"MAIL FROM:<a@example.com>"))[0].code, 503);
+        assert_eq!(
+            replies(&session.feed_line(b"MAIL FROM:<a@example.com>"))[0].code,
+            503
+        );
         session.feed_line(b"EHLO client");
-        assert_eq!(replies(&session.feed_line(b"RCPT TO:<b@example.com>"))[0].code, 503);
+        assert_eq!(
+            replies(&session.feed_line(b"RCPT TO:<b@example.com>"))[0].code,
+            503
+        );
         session.feed_line(b"MAIL FROM:<a@example.com>");
         assert_eq!(replies(&session.feed_line(b"DATA"))[0].code, 503);
     }

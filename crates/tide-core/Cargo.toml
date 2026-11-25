@@ -9,5 +9,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+mail-parser.workspace = true
 silent-protocol.workspace = true
 thiserror.workspace = true

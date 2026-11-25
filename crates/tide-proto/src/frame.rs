@@ -57,8 +57,8 @@ impl Frame {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
-        let length = u32::try_from(self.payload.len())
-            .map_err(|_| FrameError::TooLarge(u32::MAX))?;
+        let length =
+            u32::try_from(self.payload.len()).map_err(|_| FrameError::TooLarge(u32::MAX))?;
         if length > MAX_FRAME_SIZE {
             return Err(FrameError::TooLarge(length));
         }
@@ -68,10 +68,7 @@ impl Frame {
         out[5] = self.kind;
         LittleEndian::write_u16(&mut out[6..8], self.flags);
         LittleEndian::write_u32(&mut out[8..12], length);
-        LittleEndian::write_u32(
-            &mut out[12..16],
-            crc32c::crc32c(&self.payload),
-        );
+        LittleEndian::write_u32(&mut out[12..16], crc32c::crc32c(&self.payload));
         out[FRAME_HEADER_SIZE..].copy_from_slice(&self.payload);
         Ok(out)
     }
@@ -142,7 +139,10 @@ mod tests {
         let frame = Frame::new(kind::PING, vec![1, 2, 3]);
         let encoded = frame.encode().unwrap();
         assert_eq!(Frame::decode(&encoded).unwrap(), frame);
-        assert_eq!(frame_length(&encoded[..FRAME_HEADER_SIZE]).unwrap(), encoded.len());
+        assert_eq!(
+            frame_length(&encoded[..FRAME_HEADER_SIZE]).unwrap(),
+            encoded.len()
+        );
     }
 
     #[test]
