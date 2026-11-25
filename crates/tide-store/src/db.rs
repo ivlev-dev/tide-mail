@@ -427,9 +427,11 @@ impl Db {
 
     pub async fn append_message(&self, message: Message) -> Result<Receipt, StoreError> {
         message.validate()?;
+        let account_id = message.account_id.clone();
         let payload = message.encode()?;
         let batch = NewBatch::single(Record::message(message.id.clone(), payload));
-        self.append_batch(&message.account_id, batch).await
+        self.append_prepared(&account_id, batch, vec![Some(message)])
+            .await
     }
 
     pub fn append_message_blocking(&self, message: Message) -> Result<Receipt, StoreError> {
@@ -441,11 +443,21 @@ impl Db {
         account_id: &str,
         batch: NewBatch,
     ) -> Result<Receipt, StoreError> {
-        let _gate = self.gate.read().await;
         if account_id.is_empty() {
             return Err(StoreError::Config("empty account id".into()));
         }
-        validate_batch(account_id, &batch)?;
+        let decoded_messages = validate_batch(account_id, &batch)?;
+        self.append_prepared(account_id, batch, decoded_messages)
+            .await
+    }
+
+    async fn append_prepared(
+        &self,
+        account_id: &str,
+        batch: NewBatch,
+        decoded_messages: Vec<Option<Message>>,
+    ) -> Result<Receipt, StoreError> {
+        let _gate = self.gate.read().await;
         let records = batch.records.clone();
         let lane = self.lane_for_account(account_id);
         let lock = self.state().lane_locks[lane.lane_id() as usize].clone();
@@ -457,6 +469,7 @@ impl Db {
             receipt.total_len,
             receipt.seq,
             &records,
+            &decoded_messages,
         )?;
         Ok(receipt)
     }
@@ -926,6 +939,7 @@ impl Db {
         batch_len: u64,
         seq: u64,
         records: &[Record],
+        decoded_messages: &[Option<Message>],
     ) -> Result<(), StoreError> {
         let inner = self.state();
         let mut index = inner.index.write();
@@ -935,9 +949,12 @@ impl Db {
         for (record_index, record) in records.iter().enumerate() {
             match record.kind {
                 KIND_MESSAGE => {
-                    let message = Message::decode(&record.payload)?;
-                    push_change(&mut changes, ChangeEntry::from_message(seq, &message));
-                    index.insert(&message);
+                    let message = decoded_messages
+                        .get(record_index)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| StoreError::corrupt("message was not decoded"))?;
+                    push_change(&mut changes, ChangeEntry::from_message(seq, message));
+                    index.insert(message);
                     catalog.insert(
                         record.key.clone(),
                         Location {
@@ -1253,10 +1270,11 @@ fn push_change(changes: &mut HashMap<String, Vec<ChangeEntry>>, entry: ChangeEnt
         .push(entry);
 }
 
-fn validate_batch(account_id: &str, batch: &NewBatch) -> Result<(), StoreError> {
+fn validate_batch(account_id: &str, batch: &NewBatch) -> Result<Vec<Option<Message>>, StoreError> {
     if batch.records.is_empty() {
         return Err(StoreError::invalid_batch("empty batch"));
     }
+    let mut messages = Vec::with_capacity(batch.records.len());
     for record in &batch.records {
         if record.kind == KIND_MESSAGE {
             let message = Message::decode(&record.payload)?;
@@ -1270,12 +1288,15 @@ fn validate_batch(account_id: &str, batch: &NewBatch) -> Result<(), StoreError> 
                     "message id does not match record key".into(),
                 ));
             }
-        }
-        if record.kind == KIND_MOVE {
-            let _ = MovePayload::decode(&record.payload)?;
+            messages.push(Some(message));
+        } else {
+            if record.kind == KIND_MOVE {
+                let _ = MovePayload::decode(&record.payload)?;
+            }
+            messages.push(None);
         }
     }
-    Ok(())
+    Ok(messages)
 }
 
 fn decode_flags(payload: &[u8]) -> Option<u64> {

@@ -51,6 +51,7 @@ pub struct BufferedConn {
     conn: Conn,
     buffer: Vec<u8>,
     eof: bool,
+    keep_alive: bool,
 }
 
 impl BufferedConn {
@@ -59,7 +60,16 @@ impl BufferedConn {
             conn,
             buffer: Vec::new(),
             eof: false,
+            keep_alive: false,
         }
+    }
+
+    pub fn set_keep_alive(&mut self, keep_alive: bool) {
+        self.keep_alive = keep_alive;
+    }
+
+    pub fn keep_alive(&self) -> bool {
+        self.keep_alive
     }
 
     pub async fn fill(&mut self) -> io::Result<usize> {

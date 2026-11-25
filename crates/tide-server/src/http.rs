@@ -65,13 +65,17 @@ struct HttpRequest {
 
 async fn handle_connection(app: Arc<App>, conn: Conn) -> std::io::Result<()> {
     let mut conn = BufferedConn::new(conn);
-    let Some(request) = read_request(&mut conn).await? else {
-        return Ok(());
-    };
-    if let Err(error) = route(&app, &mut conn, &request).await {
-        send_error(&mut conn, error.status, error.code, &error.message).await?;
+    loop {
+        let Some(request) = read_request(&mut conn).await? else {
+            return Ok(());
+        };
+        if let Err(error) = route(&app, &mut conn, &request).await {
+            send_error(&mut conn, error.status, error.code, &error.message).await?;
+        }
+        if !conn.keep_alive() {
+            return Ok(());
+        }
     }
-    Ok(())
 }
 
 async fn read_request(conn: &mut BufferedConn) -> std::io::Result<Option<HttpRequest>> {
@@ -87,6 +91,7 @@ async fn read_request(conn: &mut BufferedConn) -> std::io::Result<Option<HttpReq
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     let method = request.method.unwrap_or("GET").to_string();
     let path = request.path.unwrap_or("/").to_string();
+    let version = request.version.unwrap_or(1);
     let mut header_map = HashMap::new();
     for header in request.headers {
         let value = String::from_utf8_lossy(header.value).to_string();
@@ -102,6 +107,16 @@ async fn read_request(conn: &mut BufferedConn) -> std::io::Result<Option<HttpReq
             "request body too large",
         ));
     }
+    let connection = header_map
+        .get("connection")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let keep_alive = if version >= 1 {
+        connection != "close"
+    } else {
+        connection == "keep-alive"
+    };
+    conn.set_keep_alive(keep_alive);
     let body = conn.read_exact(content_length, MAX_BODY).await?;
     Ok(Some(HttpRequest {
         method,
@@ -684,8 +699,13 @@ async fn send_attachment(
     } else {
         &content_type
     };
+    let connection = if conn.keep_alive() {
+        "keep-alive"
+    } else {
+        "close"
+    };
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\nConnection: {connection}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
         attachment.data.len()
     );
     conn.write_all(headers.as_bytes()).await?;
@@ -764,8 +784,13 @@ async fn send_response(
     body: &[u8],
 ) -> std::io::Result<()> {
     let reason = status_text(status);
+    let connection = if conn.keep_alive() {
+        "keep-alive"
+    } else {
+        "close"
+    };
     let headers = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, X-Admin-Token\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, X-Admin-Token\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n",
         body.len()
     );
     conn.write_all(headers.as_bytes()).await?;

@@ -1,16 +1,22 @@
 use std::time::Instant;
 
 use tide_core::{Address, Message};
-use tide_store::{Db, SearchQuery, StoreOptions};
+use tide_store::{Db, Durability, SearchQuery, StoreOptions};
 
 fn main() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("bench.tide");
+    let durability = if std::env::var("TIDE_BENCH_NONE").is_ok() {
+        Durability::None
+    } else {
+        Durability::DataSync
+    };
     let db = Db::open(
         &path,
         StoreOptions::default()
             .with_data_lanes(8)
-            .with_lane_capacity(64 * 1024 * 1024),
+            .with_lane_capacity(64 * 1024 * 1024)
+            .with_durability(durability),
     )
     .expect("open");
     let started = Instant::now();

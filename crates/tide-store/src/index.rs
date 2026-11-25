@@ -368,7 +368,7 @@ impl SearchIndex {
                 (*source, term.clone(), idf)
             })
             .collect::<Vec<_>>();
-        let mut hits = Vec::new();
+        let mut scored = Vec::with_capacity(candidates.len());
         for doc_id in candidates.drain(..) {
             let Some(slot) = self.slots.get(doc_id as usize) else {
                 continue;
@@ -416,44 +416,46 @@ impl SearchIndex {
                 }
                 value
             };
-            hits.push(SearchHit {
-                id: slot.doc.id.clone(),
-                account_id: slot.doc.account_id.clone(),
-                mailbox: slot.doc.mailbox.clone(),
-                subject: slot.doc.subject.clone(),
-                from: slot.doc.from.clone(),
-                date: slot.doc.date,
-                flags: slot.doc.flags,
-                score: (score * 1000.0).round() as u64,
-                snippet: String::new(),
-            });
+            scored.push((doc_id, (score * 1000.0).round() as u64, slot.doc.date));
         }
 
-        hits.sort_by(|left, right| {
+        let comparator = |left: &(u32, u64, i64), right: &(u32, u64, i64)| {
             right
-                .score
-                .cmp(&left.score)
-                .then_with(|| right.date.cmp(&left.date))
-                .then_with(|| left.id.cmp(&right.id))
-        });
+                .1
+                .cmp(&left.1)
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| left.0.cmp(&right.0))
+        };
         let limit = query.limit.clamp(1, MAX_LIMIT);
-        let mut selected = hits
+        let keep = (query.offset.saturating_add(limit)).min(scored.len());
+        if scored.len() > keep && keep > 0 {
+            scored.select_nth_unstable_by(keep, comparator);
+            scored.truncate(keep);
+        }
+        scored.sort_by(comparator);
+        let scored_terms_plain = scored_terms
+            .iter()
+            .map(|(source, term, _)| (*source, term.clone()))
+            .collect::<Vec<_>>();
+        scored
             .into_iter()
             .skip(query.offset)
             .take(limit)
-            .collect::<Vec<_>>();
-        for hit in &mut selected {
-            if let Some(doc) = self.get(&hit.id) {
-                hit.snippet = make_snippet(
-                    doc,
-                    &scored_terms
-                        .iter()
-                        .map(|(source, term, _)| (*source, term.clone()))
-                        .collect::<Vec<_>>(),
-                );
-            }
-        }
-        selected
+            .filter_map(|(doc_id, score, _)| {
+                let slot = self.slots.get(doc_id as usize)?;
+                Some(SearchHit {
+                    id: slot.doc.id.clone(),
+                    account_id: slot.doc.account_id.clone(),
+                    mailbox: slot.doc.mailbox.clone(),
+                    subject: slot.doc.subject.clone(),
+                    from: slot.doc.from.clone(),
+                    date: slot.doc.date,
+                    flags: slot.doc.flags,
+                    score,
+                    snippet: make_snippet(&slot.doc, &scored_terms_plain),
+                })
+            })
+            .collect()
     }
 }
 
@@ -496,10 +498,9 @@ fn tf(map: &HashMap<String, Vec<Posting>>, term: &str, doc_id: u32) -> u32 {
     map.get(term)
         .and_then(|postings| {
             postings
-                .iter()
-                .rev()
-                .find(|posting| posting.doc == doc_id)
-                .map(|posting| posting.tf)
+                .binary_search_by_key(&doc_id, |posting| posting.doc)
+                .ok()
+                .map(|index| postings[index].tf)
         })
         .unwrap_or(0)
 }
