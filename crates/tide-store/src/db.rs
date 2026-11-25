@@ -18,6 +18,7 @@ use crate::batch::{
     DecodedBatch, KIND_DELETE, KIND_FLAGS, KIND_MESSAGE, KIND_META, KIND_MOVE, NewBatch, Record,
     decode_batch,
 };
+use crate::blob::BlobStore;
 use crate::change::{ChangeEntry, ChangesPage, SyncCursor, kind as change_kind};
 use crate::error::StoreError;
 use crate::folder::{DEFAULT_FOLDERS, Folder, FolderRecord, validate_folder_name};
@@ -26,7 +27,7 @@ use crate::format::{
     LANE_HEADER_SIZE, LaneHeader, MAX_LANE_CAPACITY, MIN_LANE_CAPACITY, SUPERBLOCK_A_OFFSET,
     SUPERBLOCK_B_OFFSET, SUPERBLOCK_SIZE, Superblock, file_size, lane_base, lane_data_start,
 };
-use crate::index::{SearchHit, SearchIndex, SearchQuery};
+use crate::index::{SearchHit, SearchQuery, ShardedIndex};
 use crate::lane::{Durability, LaneWriter, Receipt, replay_lane, spawn_lane, write_all_at};
 
 const MAX_DATA_LANES: u16 = 128;
@@ -36,6 +37,7 @@ pub struct StoreOptions {
     pub data_lanes: u16,
     pub lane_capacity: u64,
     pub durability: Durability,
+    pub blob_dir: Option<PathBuf>,
 }
 
 impl Default for StoreOptions {
@@ -44,6 +46,7 @@ impl Default for StoreOptions {
             data_lanes: DEFAULT_DATA_LANES,
             lane_capacity: DEFAULT_LANE_CAPACITY,
             durability: Durability::DataSync,
+            blob_dir: None,
         }
     }
 }
@@ -61,6 +64,11 @@ impl StoreOptions {
 
     pub fn with_durability(mut self, durability: Durability) -> Self {
         self.durability = durability;
+        self
+    }
+
+    pub fn with_blob_dir(mut self, blob_dir: impl Into<PathBuf>) -> Self {
+        self.blob_dir = Some(blob_dir.into());
         self
     }
 
@@ -124,14 +132,15 @@ struct LanePosition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Snapshot {
     version: u32,
-    index: SearchIndex,
+    index: ShardedIndex,
     catalog: HashMap<String, Location>,
     changes: HashMap<String, Vec<ChangeEntry>>,
     folders: HashMap<String, BTreeMap<String, Folder>>,
+    blob_refs: HashMap<String, String>,
     lanes: Vec<LanePosition>,
 }
 
-const SNAPSHOT_VERSION: u32 = 3;
+const SNAPSHOT_VERSION: u32 = 5;
 const SNAPSHOT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, SilentProto)]
@@ -175,10 +184,11 @@ impl Snapshot {
 
 #[derive(Clone)]
 struct ApplyContext {
-    index: Arc<RwLock<SearchIndex>>,
+    index: Arc<RwLock<ShardedIndex>>,
     catalog: Arc<RwLock<HashMap<String, Location>>>,
     changes: Arc<RwLock<HashMap<String, Vec<ChangeEntry>>>>,
     folders: Arc<RwLock<HashMap<String, BTreeMap<String, Folder>>>>,
+    blob_refs: Arc<RwLock<HashMap<String, String>>>,
 }
 
 struct ApplyJob {
@@ -245,10 +255,12 @@ struct DbInner {
     superblock: Superblock,
     generation: AtomicU64,
     lanes: Vec<LaneWriter>,
-    index: Arc<RwLock<SearchIndex>>,
+    index: Arc<RwLock<ShardedIndex>>,
     catalog: Arc<RwLock<HashMap<String, Location>>>,
     changes: Arc<RwLock<HashMap<String, Vec<ChangeEntry>>>>,
     folders: Arc<RwLock<HashMap<String, BTreeMap<String, Folder>>>>,
+    blob_refs: Arc<RwLock<HashMap<String, String>>>,
+    blobs: Arc<BlobStore>,
     apply: ApplyHandle,
     options: StoreOptions,
 }
@@ -265,6 +277,13 @@ struct MovePayload {
     mailbox: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, SilentProto)]
+struct BlobRefRecord {
+    attachment_id: u32,
+    blob_id: String,
+    message_id: String,
+}
+
 impl Db {
     pub fn open(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self, StoreError> {
         options.validate()?;
@@ -274,6 +293,11 @@ impl Db {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        let blob_root = options
+            .blob_dir
+            .clone()
+            .unwrap_or_else(|| path.with_file_name("blobs"));
+        let blobs = Arc::new(BlobStore::new(blob_root)?);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -354,6 +378,10 @@ impl Db {
             .as_ref()
             .map(|snapshot| snapshot.folders.clone())
             .unwrap_or_default();
+        let mut blob_refs = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.blob_refs.clone())
+            .unwrap_or_default();
         let mut lanes = Vec::with_capacity(superblock.lane_count as usize);
         let mut lane_seqs = HashMap::new();
         let mut init_ring = io_uring::IoUring::new(8).map_err(StoreError::Io)?;
@@ -404,6 +432,7 @@ impl Db {
                             &mut catalog,
                             &mut changes,
                             &mut folders,
+                            &mut blob_refs,
                         )?;
                     }
                     offset += batch.total_len;
@@ -450,12 +479,14 @@ impl Db {
         let catalog = Arc::new(RwLock::new(catalog));
         let changes = Arc::new(RwLock::new(changes));
         let folders = Arc::new(RwLock::new(folders));
+        let blob_refs = Arc::new(RwLock::new(blob_refs));
         let apply = spawn_apply_worker(
             ApplyContext {
                 index: Arc::clone(&index),
                 catalog: Arc::clone(&catalog),
                 changes: Arc::clone(&changes),
                 folders: Arc::clone(&folders),
+                blob_refs: Arc::clone(&blob_refs),
             },
             lane_seqs,
         );
@@ -470,6 +501,8 @@ impl Db {
             catalog,
             changes,
             folders,
+            blob_refs,
+            blobs,
             apply,
             options,
         };
@@ -515,6 +548,64 @@ impl Db {
 
     pub fn append_message_blocking(&self, message: Message) -> Result<Receipt, StoreError> {
         futures::executor::block_on(self.append_message(message))
+    }
+
+    pub async fn append_message_with_blobs(
+        &self,
+        mut message: Message,
+    ) -> Result<Receipt, StoreError> {
+        message.validate()?;
+        let account_id = message.account_id.clone();
+        let message_id = message.id.clone();
+        let mut records = Vec::new();
+        let mut decoded = Vec::new();
+        let mut references = Vec::new();
+        for (index, attachment) in message.attachments.iter_mut().enumerate() {
+            if !attachment.data.is_empty() {
+                let blob_id = self.state().blobs.put(&attachment.data)?;
+                attachment.data.clear();
+                references.push((index, blob_id));
+            }
+        }
+        records.push(Record::message(message_id.clone(), message.encode()?));
+        decoded.push(Some(message));
+        for (index, blob_id) in references {
+            records.push(Record::new(
+                KIND_META,
+                format!("blobref:{message_id}:{index}"),
+                BlobRefRecord {
+                    attachment_id: index as u32,
+                    blob_id,
+                    message_id: message_id.clone(),
+                }
+                .encode()?,
+            ));
+            decoded.push(None);
+        }
+        let batch = NewBatch::new(records);
+        self.append_prepared(&account_id, batch, decoded).await
+    }
+
+    pub async fn get_attachment(
+        &self,
+        message_id: &str,
+        attachment_id: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(message) = self.get_message(message_id)? else {
+            return Ok(None);
+        };
+        let Some(attachment) = message.attachments.get(attachment_id) else {
+            return Ok(None);
+        };
+        if !attachment.data.is_empty() {
+            return Ok(Some(attachment.data.clone()));
+        }
+        let key = format!("{message_id}:{attachment_id}");
+        let blob_id = self.state().blob_refs.read().get(&key).cloned();
+        let Some(blob_id) = blob_id else {
+            return Ok(None);
+        };
+        Ok(Some(self.state().blobs.get(&blob_id)?))
     }
 
     pub async fn append_messages(
@@ -713,14 +804,7 @@ impl Db {
             return Err(StoreError::Config("cannot delete a default folder".into()));
         }
         self.ensure_default_folders(account_id).await?;
-        let ids = self
-            .state()
-            .index
-            .read()
-            .iter()
-            .filter(|doc| doc.account_id == account_id && doc.mailbox == name)
-            .map(|doc| doc.id.clone())
-            .collect::<Vec<_>>();
+        let ids = self.state().index.read().ids_in_folder(account_id, name);
         self.move_many(account_id, &ids, "Trash").await?;
         let record = FolderRecord::delete(account_id, name, "custom");
         self.append_batch(
@@ -770,10 +854,7 @@ impl Db {
             .state()
             .index
             .read()
-            .iter()
-            .filter(|doc| doc.account_id == account_id && doc.mailbox == old_name)
-            .map(|doc| doc.id.clone())
-            .collect::<Vec<_>>();
+            .ids_in_folder(account_id, old_name);
         self.move_many(account_id, &ids, new_name).await?;
         let mut records = vec![Record::new(
             KIND_META,
@@ -820,7 +901,7 @@ impl Db {
         let inner = self.state();
         let index = inner.index.read();
         let mut stats = AccountStats::default();
-        for doc in index.iter().filter(|doc| doc.account_id == account_id) {
+        for doc in index.docs_for_account(account_id).iter() {
             stats.total += 1;
             if doc.flags & tide_core::flags::SEEN == 0 {
                 stats.unread += 1;
@@ -947,6 +1028,10 @@ impl Db {
 
     pub async fn snapshot(&self) -> Result<(), StoreError> {
         let _guard = self.gate.write().await;
+        self.snapshot_locked().await
+    }
+
+    async fn snapshot_locked(&self) -> Result<(), StoreError> {
         let mut positions = Vec::new();
         for lane_id in FIRST_DATA_LANE..self.state().superblock.lane_count {
             let lane = &self.state().lanes[lane_id as usize];
@@ -963,6 +1048,7 @@ impl Db {
             catalog: self.state().catalog.read().clone(),
             changes: self.state().changes.read().clone(),
             folders: self.state().folders.read().clone(),
+            blob_refs: self.state().blob_refs.read().clone(),
             lanes: positions.clone(),
         };
         let bytes = snapshot.encode()?;
@@ -1006,6 +1092,30 @@ impl Db {
         self.persist_superblock()
     }
 
+    pub async fn backup_to(&self, target: impl AsRef<Path>) -> Result<StoreStats, StoreError> {
+        let _guard = self.gate.write().await;
+        self.snapshot_locked().await?;
+        let target = target.as_ref();
+        std::fs::create_dir_all(target)?;
+        let source = self.state();
+        std::fs::copy(source.path.as_path(), target.join("mail.tide"))?;
+        source.blobs.copy_to(&target.join("blobs"))?;
+        let manifest = format!(
+            "{{\"format\":\"tide-backup\",\"generation\":{},\"messages\":{},\"created_at\":{}}}\n",
+            source.generation.load(Ordering::Relaxed),
+            source.index.read().len(),
+            crate::batch::now_millis()
+        );
+        std::fs::write(target.join("manifest.json"), manifest)?;
+        Ok(StoreStats {
+            path: target.to_path_buf(),
+            generation: source.generation.load(Ordering::Relaxed),
+            data_lanes: source.superblock.data_lanes,
+            lane_capacity: source.superblock.lane_capacity,
+            messages: source.index.read().len(),
+        })
+    }
+
     pub async fn compact(&self) -> Result<StoreStats, StoreError> {
         let _gate = self.gate.write().await;
         let old = self.state();
@@ -1019,15 +1129,17 @@ impl Db {
             std::fs::remove_file(&temp)?;
         }
         let new_db = Db::open(&temp, old.options.clone())?;
-        let ids = old
-            .index
-            .read()
-            .iter()
-            .map(|doc| doc.id.clone())
-            .collect::<Vec<_>>();
+        let ids = old.index.read().ids();
         for id in ids {
-            if let Some(message) = self.get_message(&id)? {
-                new_db.append_message(message).await?;
+            if let Some(mut message) = self.get_message(&id)? {
+                for index in 0..message.attachments.len() {
+                    if message.attachments[index].data.is_empty() {
+                        if let Ok(Some(data)) = self.get_attachment(&id, index).await {
+                            message.attachments[index].data = data;
+                        }
+                    }
+                }
+                new_db.append_message_with_blobs(message).await?;
             }
         }
         new_db.flush().await?;
@@ -1143,6 +1255,7 @@ fn apply_job(context: &ApplyContext, job: &ApplyJob) -> Result<(), StoreError> {
     let mut catalog = context.catalog.write();
     let mut changes = context.changes.write();
     let mut folders = context.folders.write();
+    let mut blob_refs = context.blob_refs.write();
     for (record_index, record) in job.records.iter().enumerate() {
         match record.kind {
             KIND_MESSAGE => {
@@ -1172,6 +1285,7 @@ fn apply_job(context: &ApplyContext, job: &ApplyJob) -> Result<(), StoreError> {
                 }
                 index.delete(&record.key);
                 catalog.remove(&record.key);
+                blob_refs.retain(|key, _| !key.starts_with(&format!("{}:", record.key)));
             }
             KIND_FLAGS => {
                 if let Some(flags) = decode_flags(&record.payload) {
@@ -1195,6 +1309,14 @@ fn apply_job(context: &ApplyContext, job: &ApplyJob) -> Result<(), StoreError> {
             KIND_META if record.key.starts_with("folder:") => {
                 if let Ok(folder) = FolderRecord::decode(&record.payload) {
                     apply_folder(&mut folders, folder);
+                }
+            }
+            KIND_META if record.key.starts_with("blobref:") => {
+                if let Ok(reference) = BlobRefRecord::decode(&record.payload) {
+                    blob_refs.insert(
+                        format!("{}:{}", reference.message_id, reference.attachment_id),
+                        reference.blob_id,
+                    );
                 }
             }
             _ => {}
@@ -1356,14 +1478,16 @@ fn read_lane_header(
     Ok(header)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_batch_to_maps(
     lane_id: u16,
     batch: &DecodedBatch,
     offset: u64,
-    index: &mut SearchIndex,
+    index: &mut ShardedIndex,
     catalog: &mut HashMap<String, Location>,
     changes: &mut HashMap<String, Vec<ChangeEntry>>,
     folders: &mut HashMap<String, BTreeMap<String, Folder>>,
+    blob_refs: &mut HashMap<String, String>,
 ) -> Result<(), StoreError> {
     let seq = batch.seq;
     for (record_index, record) in batch.records.iter().enumerate() {
@@ -1391,6 +1515,7 @@ fn apply_batch_to_maps(
                 }
                 index.delete(&record.key);
                 catalog.remove(&record.key);
+                blob_refs.retain(|key, _| !key.starts_with(&format!("{}:", record.key)));
             }
             KIND_FLAGS => {
                 if let Some(flags) = decode_flags(&record.payload) {
@@ -1414,6 +1539,14 @@ fn apply_batch_to_maps(
             KIND_META if record.key.starts_with("folder:") => {
                 if let Ok(folder) = FolderRecord::decode(&record.payload) {
                     apply_folder(folders, folder);
+                }
+            }
+            KIND_META if record.key.starts_with("blobref:") => {
+                if let Ok(reference) = BlobRefRecord::decode(&record.payload) {
+                    blob_refs.insert(
+                        format!("{}:{}", reference.message_id, reference.attachment_id),
+                        reference.blob_id,
+                    );
                 }
             }
             _ => {}
@@ -1591,6 +1724,65 @@ mod tests {
         drop(db);
         let db = Db::open(&path, options()).unwrap();
         assert_eq!(db.index_size(), 400);
+    }
+
+    #[test]
+    fn externalizes_attachments_to_blob_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.tide");
+        let db = Db::open(&path, options()).unwrap();
+        let mut message = message("blob1", "alice", "Attachment", "body");
+        message.attachments.push(tide_core::Attachment {
+            filename: "file.bin".into(),
+            content_type: "application/octet-stream".into(),
+            size: 5,
+            data: b"hello".to_vec(),
+        });
+        futures::executor::block_on(db.append_message_with_blobs(message)).unwrap();
+        assert_eq!(
+            futures::executor::block_on(db.get_attachment("blob1", 0)).unwrap(),
+            Some(b"hello".to_vec())
+        );
+        assert!(
+            db.get_message("blob1").unwrap().unwrap().attachments[0]
+                .data
+                .is_empty()
+        );
+        drop(db);
+        let db = Db::open(&path, options()).unwrap();
+        assert_eq!(
+            futures::executor::block_on(db.get_attachment("blob1", 0)).unwrap(),
+            Some(b"hello".to_vec())
+        );
+        futures::executor::block_on(db.compact()).unwrap();
+        assert_eq!(
+            futures::executor::block_on(db.get_attachment("blob1", 0)).unwrap(),
+            Some(b"hello".to_vec())
+        );
+    }
+
+    #[test]
+    fn backup_copies_database_and_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.tide");
+        let db = Db::open(&path, options()).unwrap();
+        let mut message = message("backup1", "alice", "Backup", "body");
+        message.attachments.push(tide_core::Attachment {
+            filename: "file.bin".into(),
+            content_type: "application/octet-stream".into(),
+            size: 5,
+            data: b"hello".to_vec(),
+        });
+        futures::executor::block_on(db.append_message_with_blobs(message)).unwrap();
+        let target = directory.path().join("backup");
+        futures::executor::block_on(db.backup_to(&target)).unwrap();
+        drop(db);
+        let restored = Db::open(target.join("mail.tide"), options()).unwrap();
+        assert_eq!(restored.index_size(), 1);
+        assert_eq!(
+            futures::executor::block_on(restored.get_attachment("backup1", 0)).unwrap(),
+            Some(b"hello".to_vec())
+        );
     }
 
     #[test]

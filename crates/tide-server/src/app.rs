@@ -8,6 +8,7 @@ use tide_store::Db;
 use crate::auth::Registry;
 use crate::config::Config;
 use crate::outbound::OutboundQueue;
+use crate::virus_scan::VirusScanner;
 
 pub struct App {
     pub config: Config,
@@ -17,9 +18,11 @@ pub struct App {
     pub outbound: Option<Arc<OutboundQueue>>,
     pub email_auth: Option<Arc<MessageAuthenticator>>,
     pub spam: Option<Arc<SpamEngine>>,
+    pub antivirus: Option<Arc<VirusScanner>>,
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         db: Db,
@@ -28,6 +31,7 @@ impl App {
         outbound: Option<Arc<OutboundQueue>>,
         email_auth: Option<Arc<MessageAuthenticator>>,
         spam: Option<Arc<SpamEngine>>,
+        antivirus: Option<Arc<VirusScanner>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
@@ -37,6 +41,7 @@ impl App {
             outbound,
             email_auth,
             spam,
+            antivirus,
         })
     }
 }

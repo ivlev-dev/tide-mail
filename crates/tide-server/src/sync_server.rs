@@ -13,16 +13,19 @@ use tide_sync::{ServerSession, SyncBackend, SyncError, backend::SyncAuth as Auth
 use crate::app::App;
 use crate::convert::change_to_sync;
 use crate::net::{BufferedConn, Conn};
+use crate::virus_scan::VirusScanner;
 
 pub struct StoreSyncBackend {
     db: Db,
+    antivirus: Option<Arc<VirusScanner>>,
     transactions: RwLock<std::collections::HashMap<String, SyncPushResult>>,
 }
 
 impl StoreSyncBackend {
-    pub fn new(db: Db) -> Arc<Self> {
+    pub fn new(db: Db, antivirus: Option<Arc<VirusScanner>>) -> Arc<Self> {
         Arc::new(Self {
             db,
+            antivirus,
             transactions: RwLock::new(std::collections::HashMap::new()),
         })
     }
@@ -93,6 +96,9 @@ impl SyncBackend for StoreSyncBackend {
                         if payload.account_id != account_id {
                             return Err(SyncError::Unauthorized("account mismatch".into()));
                         }
+                        if let Some(scanner) = &self.antivirus {
+                            scanner.scan(&payload.raw).map_err(SyncError::Backend)?;
+                        }
                         let message_id = if payload.message_id.is_empty() {
                             uuid::Uuid::new_v4().to_string()
                         } else {
@@ -106,7 +112,7 @@ impl SyncBackend for StoreSyncBackend {
                         )
                         .map_err(|error| SyncError::Backend(error.to_string()))?;
                         message.flags = payload.flags;
-                        futures::executor::block_on(self.db.append_message(message))
+                        futures::executor::block_on(self.db.append_message_with_blobs(message))
                             .map(|_| ())
                             .map_err(|error| SyncError::Backend(error.to_string()))
                     });
@@ -252,7 +258,7 @@ impl AuthProvider for crate::auth::Registry {
 }
 
 pub async fn serve_sync(app: Arc<App>, listener: TcpListener, use_tls: bool) {
-    let backend = StoreSyncBackend::new(app.db.clone());
+    let backend = StoreSyncBackend::new(app.db.clone(), app.antivirus.clone());
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {

@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod blob;
 pub mod change;
 pub mod db;
 pub mod error;
@@ -8,6 +9,7 @@ pub mod index;
 pub mod lane;
 
 pub use batch::{DecodedBatch, NewBatch, Record, Record as StoredRecord};
+pub use blob::BlobStore;
 pub use change::{ChangeEntry, ChangesPage, SyncCursor};
 pub use db::{AccountStats, Db, MailboxStats, StoreOptions, StoreStats};
 pub use error::StoreError;

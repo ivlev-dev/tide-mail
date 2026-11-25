@@ -12,6 +12,7 @@ mod smtp;
 mod sync_server;
 mod tls;
 mod tls_policy;
+mod virus_scan;
 
 use std::sync::Arc;
 
@@ -36,9 +37,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let db = match Db::open(
-        &config.server.data_path,
-        StoreOptions::default()
+    let db = match Db::open(&config.server.data_path, {
+        let options = StoreOptions::default()
             .with_data_lanes(config.server.data_lanes)
             .with_lane_capacity(
                 config
@@ -46,8 +46,13 @@ fn main() {
                     .lane_capacity_mb
                     .saturating_mul(1024 * 1024)
                     .max(4 * 1024 * 1024),
-            ),
-    ) {
+            );
+        if let Some(blob_dir) = &config.server.blob_dir {
+            options.with_blob_dir(blob_dir)
+        } else {
+            options
+        }
+    }) {
         Ok(db) => db,
         Err(error) => {
             eprintln!("не удалось открыть хранилище: {error}");
@@ -103,6 +108,13 @@ fn main() {
     } else {
         None
     };
+    let antivirus = if config.antivirus.enabled {
+        Some(std::sync::Arc::new(virus_scan::VirusScanner::new(
+            config.antivirus.clone(),
+        )))
+    } else {
+        None
+    };
     let outbound = if config.server.outbound_enabled {
         let outbound_dir = config
             .server
@@ -129,6 +141,7 @@ fn main() {
         outbound,
         email_auth,
         spam,
+        antivirus,
     );
 
     println!(

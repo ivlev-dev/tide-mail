@@ -8,6 +8,8 @@
 |---|---|---|
 | `hostname` | string | EHLO/сертификат/DSN |
 | `data_path` | path | файл `mail.tide` |
+| `blob_dir` | path? | blob-store вложений |
+| `backup_dir` | path? | каталог backup-эндпоинта |
 | `data_lanes` | u16 | число data-lane (1..128) |
 | `lane_capacity_mb` | u64 | ёмкость одного lane, МиБ |
 | `workers` | usize | число io_uring-воркеров |
@@ -46,6 +48,14 @@ reject_dmarc_fail = false
 ```
 
 Требует системный DNS resolver.
+
+## `[antivirus]`
+
+```toml
+enabled = true
+clamav_addr = "127.0.0.1:3310"
+# command = "clamdscan"
+```
 
 ## `[spam]`
 

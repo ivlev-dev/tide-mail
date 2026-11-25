@@ -174,6 +174,14 @@ impl ApiError {
         }
     }
 
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: 503,
+            code: 503,
+            message: message.into(),
+        }
+    }
+
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: 403,
@@ -199,7 +207,7 @@ impl From<AuthError> for ApiError {
 }
 
 async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Result<(), ApiError> {
-    if request.method == "GET" && request.path == "/health" {
+    if request.method == "GET" && matches!(request.path.as_str(), "/health" | "/ready") {
         let body = format!(
             "{{\"status\":\"ok\",\"messages\":{},\"accounts\":{}}}",
             app.db.index_size(),
@@ -250,6 +258,26 @@ async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Res
                     .await
                     .map_err(|error| ApiError::internal(error.to_string()))
             }
+            "/v1/admin/backup" => {
+                let Some(root) = app.config.server.backup_dir.as_ref() else {
+                    return Err(ApiError::unavailable("backup_dir is not configured"));
+                };
+                let target = root.join(crate::auth::now_millis().to_string());
+                let stats = app
+                    .db
+                    .backup_to(&target)
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))?;
+                send_proto(
+                    conn,
+                    200,
+                    AckResponse {
+                        affected: stats.messages as u64,
+                    },
+                )
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))
+            }
             "/v1/admin/compact" => {
                 let stats = app
                     .db
@@ -294,7 +322,13 @@ async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Res
             .attachments
             .get(index)
             .ok_or_else(|| ApiError::not_found("attachment not found"))?;
-        return send_attachment(conn, attachment)
+        let data = app
+            .db
+            .get_attachment(message_id, index)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+            .ok_or_else(|| ApiError::not_found("attachment not found"))?;
+        return send_attachment(conn, attachment, &data)
             .await
             .map_err(|error| ApiError::internal(error.to_string()));
     }
@@ -645,10 +679,23 @@ async fn send_raw(
     mailbox: &str,
     raw: Vec<u8>,
 ) -> Result<(String, bool), ApiError> {
+    if let Some(scanner) = app.antivirus.clone() {
+        let bytes = raw.clone();
+        let handle = monoio::spawn_blocking(move || scanner.scan(&bytes));
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(ApiError::bad_request(format!(
+                    "antivirus rejected message: {error}"
+                )));
+            }
+            Err(_) => return Err(ApiError::internal("antivirus task cancelled")),
+        }
+    }
     let id = Uuid::new_v4().to_string();
     let message = parse_message(&raw, account.id.clone(), mailbox, id.clone())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    app.db.append_message(message).await?;
+    app.db.append_message_with_blobs(message).await?;
     let mut queued = false;
     if let Some(outbound) = app.outbound.as_ref() {
         for recipient in envelope_to {
@@ -669,7 +716,7 @@ async fn send_raw(
                 let copy =
                     parse_message(&raw, target.id.clone(), "INBOX", Uuid::new_v4().to_string())
                         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-                app.db.append_message(copy).await?;
+                app.db.append_message_with_blobs(copy).await?;
             }
         }
     }
@@ -679,6 +726,7 @@ async fn send_raw(
 async fn send_attachment(
     conn: &mut BufferedConn,
     attachment: &tide_core::Attachment,
+    data: &[u8],
 ) -> std::io::Result<()> {
     let filename = attachment
         .filename
@@ -706,10 +754,10 @@ async fn send_attachment(
     };
     let headers = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\nConnection: {connection}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-        attachment.data.len()
+        data.len()
     );
     conn.write_all(headers.as_bytes()).await?;
-    conn.write_all(&attachment.data).await
+    conn.write_all(data).await
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

@@ -51,6 +51,7 @@ Authorization: Bearer <token>
 | GET | `/v1/attachments/{message_id}/{attachment_id}` | — | raw file |
 | POST | `/v1/admin/snapshot` | — | `AckResponse` |
 | POST | `/v1/admin/compact` | — | `AckResponse` |
+| POST | `/v1/admin/backup` | — | `AckResponse` |
 
 `account_id` во всех запросах должен совпадать с аккаунтом токена.
 

@@ -244,7 +244,11 @@ impl SearchIndex {
     }
 
     pub fn insert(&mut self, message: &Message) {
-        if let Some(previous) = self.by_id.remove(&message.id) {
+        self.insert_doc(Doc::from(message));
+    }
+
+    pub(crate) fn insert_doc(&mut self, doc: Doc) {
+        if let Some(previous) = self.by_id.remove(&doc.id) {
             if let Some(slot) = self.slots.get_mut(previous as usize) {
                 if !slot.deleted {
                     slot.deleted = true;
@@ -253,7 +257,6 @@ impl SearchIndex {
                 }
             }
         }
-        let doc = Doc::from(message);
         let doc_id = match u32::try_from(self.slots.len()) {
             Ok(value) => value,
             Err(_) => return,
@@ -268,12 +271,13 @@ impl SearchIndex {
         add_terms(&mut self.body_terms, doc_id, &body_tokens);
         add_terms(&mut self.from_terms, doc_id, &from_tokens);
         add_terms(&mut self.to_terms, doc_id, &to_tokens);
+        let doc_id_value = doc.id.clone();
         self.slots.push(Slot {
             doc,
             deleted: false,
             length: u32::try_from(length).unwrap_or(u32::MAX),
         });
-        self.by_id.insert(message.id.clone(), doc_id);
+        self.by_id.insert(doc_id_value, doc_id);
         self.active_docs += 1;
         self.total_length += length as u64;
     }
@@ -862,6 +866,140 @@ fn is_stopword(word: &str) -> bool {
     WORDS.contains(&word)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardedIndex {
+    shards: Vec<SearchIndex>,
+}
+
+impl Default for ShardedIndex {
+    fn default() -> Self {
+        Self::new(16)
+    }
+}
+
+impl ShardedIndex {
+    pub fn new(shards: usize) -> Self {
+        Self {
+            shards: (0..shards.max(1)).map(|_| SearchIndex::new()).collect(),
+        }
+    }
+
+    fn shard_for(&self, account_id: &str) -> usize {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in account_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (hash as usize) % self.shards.len()
+    }
+
+    pub fn insert(&mut self, message: &Message) {
+        let shard = self.shard_for(&message.account_id);
+        self.shards[shard].insert(message);
+    }
+
+    pub fn delete(&mut self, id: &str) {
+        for shard in &mut self.shards {
+            if shard.by_id.contains_key(id) {
+                shard.delete(id);
+                return;
+            }
+        }
+    }
+
+    pub fn update_flags(&mut self, id: &str, flags: u64) {
+        for shard in &mut self.shards {
+            if shard.by_id.contains_key(id) {
+                shard.update_flags(id, flags);
+                return;
+            }
+        }
+    }
+
+    pub fn move_message(&mut self, id: &str, account_id: &str, mailbox: &str) {
+        let target = self.shard_for(account_id);
+        let mut moved = None;
+        for (index, shard) in self.shards.iter_mut().enumerate() {
+            if shard.by_id.contains_key(id) {
+                if index == target {
+                    shard.move_message(id, account_id, mailbox);
+                    return;
+                }
+                if let Some(doc) = shard.get(id).cloned() {
+                    shard.delete(id);
+                    moved = Some(doc);
+                }
+                break;
+            }
+        }
+        if let Some(mut doc) = moved {
+            doc.account_id = account_id.to_string();
+            doc.mailbox = mailbox.to_string();
+            self.shards[target].insert_doc(doc);
+        }
+    }
+
+    pub fn get(&self, id: &str) -> Option<&Doc> {
+        self.shards.iter().find_map(|shard| shard.get(id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(SearchIndex::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn ids(&self) -> Vec<String> {
+        self.shards
+            .iter()
+            .flat_map(|shard| shard.iter().map(|doc| doc.id.clone()))
+            .collect()
+    }
+
+    pub fn docs_for_account(&self, account_id: &str) -> Vec<Doc> {
+        self.shards[self.shard_for(account_id)]
+            .iter()
+            .filter(|doc| doc.account_id == account_id)
+            .cloned()
+            .collect()
+    }
+
+    pub fn ids_in_folder(&self, account_id: &str, mailbox: &str) -> Vec<String> {
+        self.shards[self.shard_for(account_id)]
+            .iter()
+            .filter(|doc| doc.account_id == account_id && doc.mailbox == mailbox)
+            .map(|doc| doc.id.clone())
+            .collect()
+    }
+
+    pub fn search(&self, query: &SearchQuery) -> Vec<SearchHit> {
+        if let Some(account) = &query.account_id {
+            return self.shards[self.shard_for(account)].search(query);
+        }
+        let limit = query.limit.clamp(1, MAX_LIMIT);
+        let mut hits = self
+            .shards
+            .par_iter()
+            .flat_map_iter(|shard| {
+                let mut shard_query = query.clone();
+                shard_query.limit = (query.offset + limit).min(MAX_LIMIT);
+                shard_query.offset = 0;
+                shard.search(&shard_query)
+            })
+            .collect::<Vec<_>>();
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| right.date.cmp(&left.date))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        hits.into_iter().skip(query.offset).take(limit).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +1045,35 @@ mod tests {
         assert_eq!(hits[0].id, "2");
         let hits = index.search(&SearchQuery::new().mailbox("INBOX").text("hello"));
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn sharded_index_routes_and_moves_accounts() {
+        let mut index = ShardedIndex::new(4);
+        index.insert(&message("1", "alice", "invoice", "body"));
+        index.insert(&message("2", "bob", "invoice", "body"));
+        index.insert(&message("3", "carol", "other", "body"));
+        assert_eq!(index.len(), 3);
+        assert_eq!(
+            index
+                .search(&SearchQuery::new().account("alice").text("invoice"))
+                .len(),
+            1
+        );
+        assert_eq!(index.search(&SearchQuery::new().text("invoice")).len(), 2);
+        index.move_message("1", "bob", "INBOX");
+        assert_eq!(
+            index
+                .search(&SearchQuery::new().account("alice").text("invoice"))
+                .len(),
+            0
+        );
+        assert_eq!(
+            index
+                .search(&SearchQuery::new().account("bob").text("invoice"))
+                .len(),
+            2
+        );
     }
 
     #[test]

@@ -19,16 +19,16 @@ cargo run --release -p tide-store --example bench
 ## Результат на тестовой машине
 
 ```text
-messages=5000 append=269ms (18603/s) snapshot=25ms search100=84ms hits=5000 reopen=19.9ms
-same-account concurrent messages=16000 append=488ms (32811/s) apply_pending=16000
+messages=5000 append=258ms (19388/s) snapshot=24ms search100=83ms hits=5000 reopen=19.6ms
+same-account concurrent messages=16000 append=463ms (34533/s) apply_pending=16000
 ```
 
 | Метрика | Значение |
 |---|---|
-| durable append, один поток | ~18 600 msg/s |
-| group commit, 16 потоков | ~32 800 msg/s |
+| durable append, один поток | ~19 400 msg/s |
+| group commit, 16 потоков | ~34 500 msg/s |
 | snapshot 5k | ~25 мс |
-| поиск | ~0.84 мс/запрос |
+| поиск | ~0.83 мс/запрос |
 | reopen со снапшотом | ~19.9 мс |
 
 Цифры зависят от диска: `RWF_DSYNC` упирается в fsync/кэш накопителя. На NVMe результаты выше, на HDD — ниже.
@@ -45,6 +45,8 @@ same-account concurrent messages=16000 append=488ms (32811/s) apply_pending=1600
 8. **Отдельный apply-поток.** Индекс/каталог/change log обновляются вне I/O-потока, с переупорядочиванием по `seq`.
 9. **Bulk append.** `append_messages` группирует письма в батчи до 1000 записей — для импорта.
 10. **Postings sharding.** 16 шардов по хешу терма; поиск по кандидатам >=4096 выполняется через rayon параллельно.
+11. **Account-sharded index.** 16 account-шардов; глобальный поиск идёт по шардам параллельно.
+12. **Blob-store.** Вложения вынесены из payload, дедуплицируются по SHA-256.
 
 ## Узкие места
 

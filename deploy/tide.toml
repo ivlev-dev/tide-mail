@@ -1,6 +1,7 @@
 [server]
 hostname = "mail.local"
 data_path = "/data/mail.tide"
+# blob_dir = "/data/blobs"
 data_lanes = 8
 lane_capacity_mb = 512
 workers = 2
@@ -15,11 +16,16 @@ outbound_enabled = false
 outbound_tls = true
 snapshot_interval_secs = 300
 # admin_token = "change-me"
+# backup_dir = "/data/backups"
 
 [tls]
 self_signed = true
 # cert_path = "/etc/tide/fullchain.pem"
 # key_path = "/etc/tide/privkey.pem"
+
+[antivirus]
+enabled = false
+# clamav_addr = "127.0.0.1:3310"
 
 [spam]
 enabled = true

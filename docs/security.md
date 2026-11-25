@@ -44,6 +44,7 @@
 - HTTP: лимит заголовков 64 КиБ, тела 64 МиБ.
 - Вложения: лимит 64 МиБ, sanitization `Content-Type`/`filename`, запрет CRLF в заголовках.
 - MIME парсится `mail-parser`, который не паникует на повреждённом вводе.
+- Вложения: blob-store с SHA-256 ID, проверка 64-hex, atomic rename; ClamAV INSTREAM/external scan до сохранения.
 - Спам: правила, DNSBL, external command без shell.
 - SPF/DKIM/DMARC проверяются до сохранения; политики reject настраиваются.
 
@@ -59,7 +60,7 @@
 | Нет шифрования БД at rest | средний | LUKS/ФС-шифрование |
 | DANE fail-open при DNS-ошибке | средний | задокументировано |
 | External spam command — доверенный ввод | средний | только admin-конфиг |
-| Нет virus-scan вложений | средний | hook через external filter |
+| Нет карантина заражённых писем | низкий | ClamAV/external scan до сохранения |
 | DSN не имеет rate limit | низкий | мониторить |
 | Admin token хранится в конфиге открытым текстом | средний | secrets manager/права 0600 |
 | Нет audit log действий администратора | средний | roadmap |

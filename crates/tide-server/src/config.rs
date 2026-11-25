@@ -16,12 +16,16 @@ pub struct Config {
     pub dkim: DkimSettings,
     #[serde(default)]
     pub spam: SpamSettings,
+    #[serde(default)]
+    pub antivirus: AntivirusSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSettings {
     pub hostname: String,
     pub data_path: PathBuf,
+    #[serde(default)]
+    pub blob_dir: Option<PathBuf>,
     pub data_lanes: u16,
     pub lane_capacity_mb: u64,
     pub workers: usize,
@@ -49,6 +53,8 @@ pub struct ServerSettings {
     pub snapshot_interval_secs: u64,
     #[serde(default)]
     pub admin_token: Option<String>,
+    #[serde(default)]
+    pub backup_dir: Option<PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -64,6 +70,7 @@ impl Default for ServerSettings {
         Self {
             hostname: "mail.local".into(),
             data_path: PathBuf::from("./data/mail.tide"),
+            blob_dir: None,
             data_lanes: 8,
             lane_capacity_mb: 512,
             workers: std::thread::available_parallelism()
@@ -84,6 +91,7 @@ impl Default for ServerSettings {
             dane: false,
             snapshot_interval_secs: 300,
             admin_token: None,
+            backup_dir: None,
         }
     }
 }
@@ -128,6 +136,16 @@ fn default_spam_threshold() -> f32 {
 
 fn default_reject_threshold() -> f32 {
     15.0
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AntivirusSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub clamav_addr: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 impl Default for SpamSettings {
@@ -255,6 +273,7 @@ pub const SAMPLE_CONFIG: &str = r#"# Tide Mail configuration
 [server]
 hostname = "mail.local"
 data_path = "./data/mail.tide"
+# blob_dir = "./data/blobs"
 data_lanes = 8
 lane_capacity_mb = 512
 workers = 2
@@ -273,6 +292,7 @@ dane = false
 # outbound_dir = "./data/outbound"
 snapshot_interval_secs = 300
 # admin_token = "change-me"
+# backup_dir = "./backups"
 
 [tls]
 # Оставьте пустым для самоподписанного сертификата.
@@ -284,6 +304,11 @@ self_signed = true
 enabled = false
 reject_spf_fail = false
 reject_dmarc_fail = false
+
+[antivirus]
+enabled = false
+# clamav_addr = "127.0.0.1:3310"
+# command = "clamdscan"
 
 [spam]
 enabled = false

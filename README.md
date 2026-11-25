@@ -156,6 +156,10 @@ with smtplib.SMTP("127.0.0.1", 2525) as smtp:
 ## Эксплуатация
 
 - [Конфигурация](docs/configuration.md)
+- [Blob-store вложений](docs/blob-store.md)
+- [Antivirus scanning](docs/antivirus.md)
+- [Backup и HA](docs/backup-ha.md)
+- [Sharded index](docs/index-sharding.md)
 - [Аудит безопасности](docs/security.md)
 - [Аудит производительности](docs/performance.md)
 
@@ -183,6 +187,7 @@ E2E-тест (`crates/tide-server/tests/e2e.rs`) поднимает сервер
 - Входящие SPF/DKIM/DMARC через `mail-auth` + `Authentication-Results`.
 - HTTP TLS (`http_tls`) и CORS.
 - `PUT_MESSAGE` через sync.
+- Blob-store вложений, ClamAV/external antivirus, backup API, account-sharded индекс.
 
 ## Roadmap
 

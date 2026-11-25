@@ -24,6 +24,7 @@ parking_lot.workspace = true
 rayon.workspace = true
 rust-stemmers.workspace = true
 serde.workspace = true
+sha2.workspace = true
 silent-protocol.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
