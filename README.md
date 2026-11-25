@@ -177,6 +177,7 @@ E2E-тест (`crates/tide-server/tests/e2e.rs`) поднимает сервер
 ## Дополнительно
 
 - Снапшоты индекса: пишутся в index lane, загружаются при старте, replay идёт с checkpoint.
+- Group commit в lane, отдельный apply-поток, bulk-импорт, шардированные postings и параллельный поиск.
 - Online-компакция: `POST /v1/admin/compact` (нужен `admin_token`).
 - Outbound: MX-резолв, DKIM, opportunistic STARTTLS, персистентная очередь.
 - Входящие SPF/DKIM/DMARC через `mail-auth` + `Authentication-Results`.

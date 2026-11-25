@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
@@ -10,7 +11,6 @@ use memmap2::{Mmap, MmapOptions};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use silent_protocol::SilentProto;
-use std::collections::BTreeMap;
 use tide_core::Message;
 use uuid::Uuid;
 
@@ -131,7 +131,7 @@ struct Snapshot {
     lanes: Vec<LanePosition>,
 }
 
-const SNAPSHOT_VERSION: u32 = 2;
+const SNAPSHOT_VERSION: u32 = 3;
 const SNAPSHOT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, SilentProto)]
@@ -173,6 +173,71 @@ impl Snapshot {
     }
 }
 
+#[derive(Clone)]
+struct ApplyContext {
+    index: Arc<RwLock<SearchIndex>>,
+    catalog: Arc<RwLock<HashMap<String, Location>>>,
+    changes: Arc<RwLock<HashMap<String, Vec<ChangeEntry>>>>,
+    folders: Arc<RwLock<HashMap<String, BTreeMap<String, Folder>>>>,
+}
+
+struct ApplyJob {
+    lane_id: u16,
+    seq: u64,
+    batch_offset: u64,
+    batch_len: u64,
+    records: Vec<Record>,
+    decoded_messages: Vec<Option<Message>>,
+    reply: futures_channel::oneshot::Sender<Result<(), StoreError>>,
+}
+
+enum ApplyCommand {
+    Job(ApplyJob),
+    Shutdown,
+}
+
+struct ApplyHandle {
+    tx: Sender<ApplyCommand>,
+    join: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl ApplyHandle {
+    async fn submit(
+        &self,
+        lane_id: u16,
+        seq: u64,
+        batch_offset: u64,
+        batch_len: u64,
+        records: Vec<Record>,
+        decoded_messages: Vec<Option<Message>>,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = futures_channel::oneshot::channel();
+        self.tx
+            .send(ApplyCommand::Job(ApplyJob {
+                lane_id,
+                seq,
+                batch_offset,
+                batch_len,
+                records,
+                decoded_messages,
+                reply,
+            }))
+            .map_err(|_| StoreError::Internal("apply worker stopped".into()))?;
+        receiver
+            .await
+            .map_err(|_| StoreError::Internal("apply worker stopped".into()))?
+    }
+}
+
+impl Drop for ApplyHandle {
+    fn drop(&mut self) {
+        let _ = self.tx.send(ApplyCommand::Shutdown);
+        if let Some(join) = self.join.lock().take() {
+            let _ = join.join();
+        }
+    }
+}
+
 struct DbInner {
     path: PathBuf,
     mmap: Mmap,
@@ -180,11 +245,11 @@ struct DbInner {
     superblock: Superblock,
     generation: AtomicU64,
     lanes: Vec<LaneWriter>,
-    index: RwLock<SearchIndex>,
-    catalog: RwLock<HashMap<String, Location>>,
-    changes: RwLock<HashMap<String, Vec<ChangeEntry>>>,
-    folders: RwLock<HashMap<String, BTreeMap<String, Folder>>>,
-    lane_locks: Vec<Arc<futures::lock::Mutex<()>>>,
+    index: Arc<RwLock<SearchIndex>>,
+    catalog: Arc<RwLock<HashMap<String, Location>>>,
+    changes: Arc<RwLock<HashMap<String, Vec<ChangeEntry>>>>,
+    folders: Arc<RwLock<HashMap<String, BTreeMap<String, Folder>>>>,
+    apply: ApplyHandle,
     options: StoreOptions,
 }
 
@@ -290,6 +355,7 @@ impl Db {
             .map(|snapshot| snapshot.folders.clone())
             .unwrap_or_default();
         let mut lanes = Vec::with_capacity(superblock.lane_count as usize);
+        let mut lane_seqs = HashMap::new();
         let mut init_ring = io_uring::IoUring::new(8).map_err(StoreError::Io)?;
 
         for lane_id in 0..superblock.lane_count {
@@ -362,6 +428,9 @@ impl Db {
                 base,
                 true,
             )?;
+            if lane_id >= FIRST_DATA_LANE {
+                lane_seqs.insert(lane_id, seq);
+            }
             let writer = spawn_lane(
                 lane_id,
                 Arc::clone(&file),
@@ -377,9 +446,19 @@ impl Db {
         }
 
         let generation = superblock.generation;
-        let lane_locks = (0..superblock.lane_count)
-            .map(|_| Arc::new(futures::lock::Mutex::new(())))
-            .collect();
+        let index = Arc::new(RwLock::new(index));
+        let catalog = Arc::new(RwLock::new(catalog));
+        let changes = Arc::new(RwLock::new(changes));
+        let folders = Arc::new(RwLock::new(folders));
+        let apply = spawn_apply_worker(
+            ApplyContext {
+                index: Arc::clone(&index),
+                catalog: Arc::clone(&catalog),
+                changes: Arc::clone(&changes),
+                folders: Arc::clone(&folders),
+            },
+            lane_seqs,
+        );
         let inner = DbInner {
             path,
             mmap,
@@ -387,11 +466,11 @@ impl Db {
             superblock,
             generation: AtomicU64::new(generation),
             lanes,
-            index: RwLock::new(index),
-            catalog: RwLock::new(catalog),
-            changes: RwLock::new(changes),
-            folders: RwLock::new(folders),
-            lane_locks,
+            index,
+            catalog,
+            changes,
+            folders,
+            apply,
             options,
         };
         Ok(Self {
@@ -438,6 +517,45 @@ impl Db {
         futures::executor::block_on(self.append_message(message))
     }
 
+    pub async fn append_messages(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<Vec<Receipt>, StoreError> {
+        let mut groups: HashMap<String, Vec<Message>> = HashMap::new();
+        for message in messages {
+            message.validate()?;
+            groups
+                .entry(message.account_id.clone())
+                .or_default()
+                .push(message);
+        }
+        let mut receipts = Vec::new();
+        for (account_id, mut messages) in groups {
+            while !messages.is_empty() {
+                let chunk = messages
+                    .drain(..messages.len().min(1000))
+                    .collect::<Vec<_>>();
+                let mut records = Vec::with_capacity(chunk.len());
+                let mut decoded = Vec::with_capacity(chunk.len());
+                for message in chunk {
+                    let payload = message.encode()?;
+                    records.push(Record::message(message.id.clone(), payload));
+                    decoded.push(Some(message));
+                }
+                let batch = NewBatch::new(records);
+                receipts.push(self.append_prepared(&account_id, batch, decoded).await?);
+            }
+        }
+        Ok(receipts)
+    }
+
+    pub fn append_messages_blocking(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<Vec<Receipt>, StoreError> {
+        futures::executor::block_on(self.append_messages(messages))
+    }
+
     pub async fn append_batch(
         &self,
         account_id: &str,
@@ -458,19 +576,29 @@ impl Db {
         decoded_messages: Vec<Option<Message>>,
     ) -> Result<Receipt, StoreError> {
         let _gate = self.gate.read().await;
-        let records = batch.records.clone();
         let lane = self.lane_for_account(account_id);
-        let lock = self.state().lane_locks[lane.lane_id() as usize].clone();
-        let _guard = lock.lock().await;
+        self.commit_lane_locked(lane, batch, decoded_messages).await
+    }
+
+    async fn commit_lane_locked(
+        &self,
+        lane: LaneWriter,
+        batch: NewBatch,
+        decoded_messages: Vec<Option<Message>>,
+    ) -> Result<Receipt, StoreError> {
+        let records = batch.records.clone();
         let receipt = lane.append(batch).await?;
-        self.apply_committed_records(
-            receipt.lane_id,
-            receipt.offset,
-            receipt.total_len,
-            receipt.seq,
-            &records,
-            &decoded_messages,
-        )?;
+        self.state()
+            .apply
+            .submit(
+                receipt.lane_id,
+                receipt.seq,
+                receipt.offset,
+                receipt.total_len,
+                records,
+                decoded_messages,
+            )
+            .await?;
         Ok(receipt)
     }
 
@@ -763,36 +891,27 @@ impl Db {
     pub async fn delete_message(&self, id: &str) -> Result<Receipt, StoreError> {
         let _gate = self.gate.read().await;
         let location = self.location(id)?;
-        let inner = self.state();
-        let lane = inner
+        let lane = self
+            .state()
             .lanes
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
-        let lock = self.state().lane_locks[lane.lane_id() as usize].clone();
-        let _guard = lock.lock().await;
-        let receipt = lane.append(NewBatch::single(Record::delete(id))).await?;
-        self.state().index.write().delete(id);
-        self.state().catalog.write().remove(id);
-        Ok(receipt)
+        self.commit_lane_locked(lane, NewBatch::single(Record::delete(id)), vec![None])
+            .await
     }
 
     pub async fn update_flags(&self, id: &str, flags: u64) -> Result<Receipt, StoreError> {
         let _gate = self.gate.read().await;
         let location = self.location(id)?;
-        let inner = self.state();
-        let lane = inner
+        let lane = self
+            .state()
             .lanes
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
-        let lock = self.state().lane_locks[lane.lane_id() as usize].clone();
-        let _guard = lock.lock().await;
-        let receipt = lane
-            .append(NewBatch::single(Record::flags(id, flags)))
-            .await?;
-        self.state().index.write().update_flags(id, flags);
-        Ok(receipt)
+        self.commit_lane_locked(lane, NewBatch::single(Record::flags(id, flags)), vec![None])
+            .await
     }
 
     pub async fn move_message(
@@ -803,24 +922,23 @@ impl Db {
     ) -> Result<Receipt, StoreError> {
         let _gate = self.gate.read().await;
         let location = self.location(id)?;
-        let inner = self.state();
-        let lane = inner
+        let lane = self
+            .state()
             .lanes
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
-        let lock = self.state().lane_locks[lane.lane_id() as usize].clone();
-        let _guard = lock.lock().await;
         let payload = MovePayload {
             account_id: account_id.to_string(),
             mailbox: mailbox.to_string(),
         }
         .encode()?;
-        let receipt = lane
-            .append(NewBatch::single(Record::new(KIND_MOVE, id, payload)))
-            .await?;
-        inner.index.write().move_message(id, account_id, mailbox);
-        Ok(receipt)
+        self.commit_lane_locked(
+            lane,
+            NewBatch::single(Record::new(KIND_MOVE, id, payload)),
+            vec![None],
+        )
+        .await
     }
 
     pub async fn flush(&self) -> Result<(), StoreError> {
@@ -932,79 +1050,6 @@ impl Db {
             .ok_or_else(|| StoreError::NotFound(id.to_string()))
     }
 
-    fn apply_committed_records(
-        &self,
-        lane_id: u16,
-        batch_offset: u64,
-        batch_len: u64,
-        seq: u64,
-        records: &[Record],
-        decoded_messages: &[Option<Message>],
-    ) -> Result<(), StoreError> {
-        let inner = self.state();
-        let mut index = inner.index.write();
-        let mut catalog = inner.catalog.write();
-        let mut changes = inner.changes.write();
-        let mut folders = inner.folders.write();
-        for (record_index, record) in records.iter().enumerate() {
-            match record.kind {
-                KIND_MESSAGE => {
-                    let message = decoded_messages
-                        .get(record_index)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| StoreError::corrupt("message was not decoded"))?;
-                    push_change(&mut changes, ChangeEntry::from_message(seq, message));
-                    index.insert(message);
-                    catalog.insert(
-                        record.key.clone(),
-                        Location {
-                            lane_id,
-                            batch_offset,
-                            batch_len,
-                            record_index,
-                        },
-                    );
-                }
-                KIND_DELETE => {
-                    if let Some(doc) = index.get(&record.key) {
-                        push_change(
-                            &mut changes,
-                            ChangeEntry::from_doc(seq, change_kind::DELETE, doc),
-                        );
-                    }
-                    index.delete(&record.key);
-                    catalog.remove(&record.key);
-                }
-                KIND_FLAGS => {
-                    if let Some(flags) = decode_flags(&record.payload) {
-                        index.update_flags(&record.key, flags);
-                        if let Some(doc) = index.get(&record.key) {
-                            let mut entry = ChangeEntry::from_doc(seq, change_kind::FLAGS, doc);
-                            entry.flags = flags;
-                            push_change(&mut changes, entry);
-                        }
-                    }
-                }
-                KIND_MOVE => {
-                    let payload = MovePayload::decode(&record.payload)?;
-                    index.move_message(&record.key, &payload.account_id, &payload.mailbox);
-                    if let Some(doc) = index.get(&record.key) {
-                        let mut entry = ChangeEntry::from_doc(seq, change_kind::MOVE, doc);
-                        entry.mailbox = payload.mailbox.clone();
-                        push_change(&mut changes, entry);
-                    }
-                }
-                KIND_META if record.key.starts_with("folder:") => {
-                    if let Ok(folder) = FolderRecord::decode(&record.payload) {
-                        apply_folder(&mut folders, folder);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
     fn persist_superblock(&self) -> Result<(), StoreError> {
         let inner = self.state();
         let generation = inner
@@ -1031,6 +1076,131 @@ impl Db {
         )?;
         Ok(())
     }
+}
+
+fn spawn_apply_worker(context: ApplyContext, next_seqs: HashMap<u16, u64>) -> ApplyHandle {
+    let (tx, rx) = unbounded();
+    let join = std::thread::Builder::new()
+        .name("tide-index-apply".into())
+        .spawn(move || run_apply_worker(context, next_seqs, rx))
+        .expect("apply worker");
+    ApplyHandle {
+        tx,
+        join: parking_lot::Mutex::new(Some(join)),
+    }
+}
+
+fn run_apply_worker(
+    context: ApplyContext,
+    mut next_seqs: HashMap<u16, u64>,
+    rx: Receiver<ApplyCommand>,
+) {
+    let mut pending: HashMap<u16, BTreeMap<u64, ApplyJob>> = HashMap::new();
+    while let Ok(command) = rx.recv() {
+        match command {
+            ApplyCommand::Job(job) => {
+                pending.entry(job.lane_id).or_default().insert(job.seq, job);
+                process_apply_ready(&context, &mut next_seqs, &mut pending);
+            }
+            ApplyCommand::Shutdown => break,
+        }
+    }
+}
+
+fn process_apply_ready(
+    context: &ApplyContext,
+    next_seqs: &mut HashMap<u16, u64>,
+    pending: &mut HashMap<u16, BTreeMap<u64, ApplyJob>>,
+) {
+    loop {
+        let mut progressed = false;
+        let lanes = next_seqs.keys().copied().collect::<Vec<_>>();
+        for lane in lanes {
+            let next = next_seqs.get(&lane).copied().unwrap_or(0);
+            let Some(jobs) = pending.get_mut(&lane) else {
+                continue;
+            };
+            let Some(job) = jobs.remove(&next) else {
+                continue;
+            };
+            let result = apply_job(context, &job);
+            let _ = job.reply.send(result);
+            next_seqs.insert(lane, next.saturating_add(1));
+            progressed = true;
+            if jobs.is_empty() {
+                pending.remove(&lane);
+            }
+            break;
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
+fn apply_job(context: &ApplyContext, job: &ApplyJob) -> Result<(), StoreError> {
+    let mut index = context.index.write();
+    let mut catalog = context.catalog.write();
+    let mut changes = context.changes.write();
+    let mut folders = context.folders.write();
+    for (record_index, record) in job.records.iter().enumerate() {
+        match record.kind {
+            KIND_MESSAGE => {
+                let message = job
+                    .decoded_messages
+                    .get(record_index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| StoreError::corrupt("message was not decoded"))?;
+                push_change(&mut changes, ChangeEntry::from_message(job.seq, message));
+                index.insert(message);
+                catalog.insert(
+                    record.key.clone(),
+                    Location {
+                        lane_id: job.lane_id,
+                        batch_offset: job.batch_offset,
+                        batch_len: job.batch_len,
+                        record_index,
+                    },
+                );
+            }
+            KIND_DELETE => {
+                if let Some(doc) = index.get(&record.key) {
+                    push_change(
+                        &mut changes,
+                        ChangeEntry::from_doc(job.seq, change_kind::DELETE, doc),
+                    );
+                }
+                index.delete(&record.key);
+                catalog.remove(&record.key);
+            }
+            KIND_FLAGS => {
+                if let Some(flags) = decode_flags(&record.payload) {
+                    index.update_flags(&record.key, flags);
+                    if let Some(doc) = index.get(&record.key) {
+                        let mut entry = ChangeEntry::from_doc(job.seq, change_kind::FLAGS, doc);
+                        entry.flags = flags;
+                        push_change(&mut changes, entry);
+                    }
+                }
+            }
+            KIND_MOVE => {
+                let payload = MovePayload::decode(&record.payload)?;
+                index.move_message(&record.key, &payload.account_id, &payload.mailbox);
+                if let Some(doc) = index.get(&record.key) {
+                    let mut entry = ChangeEntry::from_doc(job.seq, change_kind::MOVE, doc);
+                    entry.mailbox = payload.mailbox.clone();
+                    push_change(&mut changes, entry);
+                }
+            }
+            KIND_META if record.key.starts_with("folder:") => {
+                if let Ok(folder) = FolderRecord::decode(&record.payload) {
+                    apply_folder(&mut folders, folder);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn load_snapshot(batches: &[DecodedBatch]) -> Result<Option<Snapshot>, StoreError> {
@@ -1085,9 +1255,7 @@ fn load_snapshot(batches: &[DecodedBatch]) -> Result<Option<Snapshot>, StoreErro
         }
         match Snapshot::decode(&payload) {
             Ok(snapshot) => return Ok(Some(snapshot)),
-            Err(error) => {
-                eprintln!("snapshot {id} is invalid: {error}");
-            }
+            Err(error) => eprintln!("snapshot {id} is invalid: {error}"),
         }
     }
     Ok(None)
@@ -1420,6 +1588,51 @@ mod tests {
                 .len(),
             50
         );
+        drop(db);
+        let db = Db::open(&path, options()).unwrap();
+        assert_eq!(db.index_size(), 400);
+    }
+
+    #[test]
+    fn bulk_append_uses_large_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.tide");
+        let db = Db::open(&path, options().with_lane_capacity(32 * 1024 * 1024)).unwrap();
+        let messages = (0..2000)
+            .map(|index| message(&format!("b{index}"), "bulk", "Bulk", "bulk body"))
+            .collect::<Vec<_>>();
+        let receipts = futures::executor::block_on(db.append_messages(messages)).unwrap();
+        assert!(!receipts.is_empty());
+        assert_eq!(db.index_size(), 2000);
+        drop(db);
+        let db = Db::open(&path, options()).unwrap();
+        assert_eq!(db.index_size(), 2000);
+    }
+
+    #[test]
+    fn concurrent_writers_same_account_keep_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.tide");
+        let db = Db::open(&path, options().with_lane_capacity(32 * 1024 * 1024)).unwrap();
+        let mut handles = Vec::new();
+        for thread in 0..8u64 {
+            let db = db.clone();
+            handles.push(std::thread::spawn(move || {
+                for index in 0..50u64 {
+                    db.append_message_blocking(message(
+                        &format!("s{thread}-{index}"),
+                        "same",
+                        "Same account",
+                        "body",
+                    ))
+                    .unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(db.index_size(), 400);
         drop(db);
         let db = Db::open(&path, options()).unwrap();
         assert_eq!(db.index_size(), 400);

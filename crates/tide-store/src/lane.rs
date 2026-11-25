@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use io_uring::{IoUring, opcode, types};
 
 use crate::batch::{DecodedBatch, NewBatch, encode_batch};
 use crate::error::StoreError;
-use crate::format::{LANE_HEADER_SIZE, LaneHeader, MAX_BATCH_SIZE};
+use crate::format::{LANE_HEADER_SIZE, LaneHeader};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Durability {
@@ -254,70 +255,149 @@ fn run_lane(
     }
     drop(init_tx);
 
-    while let Ok(command) = rx.recv() {
-        match command {
-            LaneCommand::Write { batch, reply } => {
-                let result = state.write_batch(batch);
-                let _ = reply.send(result);
+    let mut pending: VecDeque<LaneCommand> = VecDeque::new();
+    loop {
+        let command = if let Some(command) = pending.pop_front() {
+            command
+        } else {
+            match rx.recv() {
+                Ok(command) => command,
+                Err(_) => break,
             }
-            LaneCommand::Checkpoint { reply } => {
-                let result = persist_lane_header(&file, &state);
-                let _ = reply.send(result);
+        };
+        let LaneCommand::Write { batch, reply } = command else {
+            if matches!(command, LaneCommand::Shutdown) {
+                break;
             }
-            LaneCommand::Info { reply } => {
-                let _ = reply.send(LaneInfo {
-                    head: state.head,
-                    seq: state.seq,
-                });
+            handle_lane_command(&file, &mut state, command);
+            continue;
+        };
+        let mut group: Vec<GroupWrite> = Vec::new();
+        let mut current = Some((batch, reply));
+        let mut total_bytes = 0u64;
+        let mut group_seq = state.seq;
+        while let Some((batch, reply)) = current.take() {
+            let encoded = match encode_batch(state.lane_id, group_seq, &batch) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    continue;
+                }
+            };
+            let length = encoded.len() as u64;
+            let available = (state.base + state.capacity).saturating_sub(state.head + total_bytes);
+            if length > available {
+                if group.is_empty() {
+                    let _ = reply.send(Err(StoreError::LaneFull {
+                        lane: state.lane_id,
+                        need: length,
+                        available,
+                    }));
+                } else {
+                    pending.push_front(LaneCommand::Write { batch, reply });
+                    break;
+                }
+                continue;
             }
-            LaneCommand::SetCheckpoint { head, seq, reply } => {
-                state.checkpoint_head = head;
-                state.checkpoint_seq = seq;
-                let result = persist_lane_header(&file, &state);
-                let _ = reply.send(result);
+            if !group.is_empty() && total_bytes + length > MAX_GROUP_BYTES {
+                pending.push_front(LaneCommand::Write { batch, reply });
+                break;
             }
-            LaneCommand::Shutdown => break,
+            group.push(GroupWrite {
+                encoded,
+                seq: group_seq,
+                offset: state.head + total_bytes,
+                length,
+                records: batch.records.len(),
+                reply,
+            });
+            total_bytes += length;
+            group_seq += 1;
+            if group.len() >= MAX_GROUP_WRITES {
+                break;
+            }
+            match rx.try_recv() {
+                Ok(LaneCommand::Write { batch, reply }) => current = Some((batch, reply)),
+                Ok(other) => {
+                    pending.push_back(other);
+                    break;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+        if group.is_empty() {
+            continue;
+        }
+        let mut buffer = Vec::with_capacity(total_bytes as usize);
+        for item in &group {
+            buffer.extend_from_slice(&item.encoded);
+        }
+        if let Err(error) = write_all_at(
+            &mut state.ring,
+            state.fd,
+            &buffer,
+            state.head,
+            state.durability == Durability::DataSync,
+        ) {
+            let message = error.to_string();
+            for item in group {
+                let _ = item.reply.send(Err(StoreError::Internal(message.clone())));
+            }
+            continue;
+        }
+        state.head += total_bytes;
+        state.seq = group_seq;
+        for item in group {
+            let _ = item.reply.send(Ok(Receipt {
+                lane_id: state.lane_id,
+                seq: item.seq,
+                offset: item.offset,
+                total_len: item.length,
+                records: item.records,
+                durable: state.durability == Durability::DataSync,
+            }));
         }
     }
     let _ = persist_lane_header(&file, &state);
 }
 
-impl LaneState {
-    fn write_batch(&mut self, batch: NewBatch) -> Result<Receipt, StoreError> {
-        let encoded = encode_batch(self.lane_id, self.seq, &batch)?;
-        let total_len = encoded.len() as u64;
-        if total_len > MAX_BATCH_SIZE {
-            return Err(StoreError::invalid_batch("batch too large"));
+fn handle_lane_command(file: &File, state: &mut LaneState, command: LaneCommand) {
+    match command {
+        LaneCommand::Checkpoint { reply } => {
+            let result = persist_lane_header(file, state);
+            let _ = reply.send(result);
         }
-        let available = (self.base + self.capacity).saturating_sub(self.head);
-        if total_len > available {
-            return Err(StoreError::LaneFull {
-                lane: self.lane_id,
-                need: total_len,
-                available,
+        LaneCommand::Info { reply } => {
+            let _ = reply.send(LaneInfo {
+                head: state.head,
+                seq: state.seq,
             });
         }
-        let offset = self.head;
-        write_all_at(
-            &mut self.ring,
-            self.fd,
-            &encoded,
-            offset,
-            self.durability == Durability::DataSync,
-        )?;
-        self.head += total_len;
-        let receipt = Receipt {
-            lane_id: self.lane_id,
-            seq: self.seq,
-            offset,
-            total_len,
-            records: batch.records.len(),
-            durable: self.durability == Durability::DataSync,
-        };
-        self.seq += 1;
-        Ok(receipt)
+        LaneCommand::SetCheckpoint { head, seq, reply } => {
+            state.checkpoint_head = head;
+            state.checkpoint_seq = seq;
+            let result = persist_lane_header(file, state);
+            let _ = reply.send(result);
+        }
+        LaneCommand::Shutdown => {}
+        LaneCommand::Write { reply, .. } => {
+            let _ = reply.send(Err(StoreError::Internal("unexpected write".into())));
+        }
     }
 }
+
+struct GroupWrite {
+    encoded: Vec<u8>,
+    seq: u64,
+    offset: u64,
+    length: u64,
+    records: usize,
+    reply: oneshot::Sender<Result<Receipt, StoreError>>,
+}
+
+const MAX_GROUP_WRITES: usize = 64;
+const MAX_GROUP_BYTES: u64 = 8 * 1024 * 1024;
 
 fn persist_lane_header(file: &File, state: &LaneState) -> Result<(), StoreError> {
     let header = LaneHeader {

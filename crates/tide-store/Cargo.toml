@@ -21,6 +21,7 @@ io-uring.workspace = true
 libc.workspace = true
 memmap2.workspace = true
 parking_lot.workspace = true
+rayon.workspace = true
 rust-stemmers.workspace = true
 serde.workspace = true
 silent-protocol.workspace = true

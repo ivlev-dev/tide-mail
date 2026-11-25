@@ -1,6 +1,8 @@
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use tide_core::Message;
@@ -175,6 +177,41 @@ struct Posting {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct Postings {
+    shards: Vec<HashMap<String, Vec<Posting>>>,
+}
+
+impl Default for Postings {
+    fn default() -> Self {
+        Self {
+            shards: (0..16).map(|_| HashMap::new()).collect(),
+        }
+    }
+}
+
+impl Postings {
+    fn shard(term: &str) -> usize {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in term.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (hash as usize) % 16
+    }
+
+    fn get(&self, term: &str) -> Option<&Vec<Posting>> {
+        self.shards[Self::shard(term)].get(term)
+    }
+
+    fn push(&mut self, term: &str, posting: Posting) {
+        self.shards[Self::shard(term)]
+            .entry(term.to_string())
+            .or_default()
+            .push(posting);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Slot {
     doc: Doc,
     deleted: bool,
@@ -185,10 +222,10 @@ struct Slot {
 pub struct SearchIndex {
     slots: Vec<Slot>,
     by_id: HashMap<String, u32>,
-    subject_terms: HashMap<String, Vec<Posting>>,
-    body_terms: HashMap<String, Vec<Posting>>,
-    from_terms: HashMap<String, Vec<Posting>>,
-    to_terms: HashMap<String, Vec<Posting>>,
+    subject_terms: Postings,
+    body_terms: Postings,
+    from_terms: Postings,
+    to_terms: Postings,
     total_length: u64,
     active_docs: u64,
 }
@@ -333,7 +370,7 @@ impl SearchIndex {
             }
         }
 
-        let mut candidates: Vec<u32> = if constraints.is_empty() {
+        let candidates: Vec<u32> = if constraints.is_empty() {
             self.slots
                 .iter()
                 .enumerate()
@@ -368,33 +405,30 @@ impl SearchIndex {
                 (*source, term.clone(), idf)
             })
             .collect::<Vec<_>>();
-        let mut scored = Vec::with_capacity(candidates.len());
-        for doc_id in candidates.drain(..) {
-            let Some(slot) = self.slots.get(doc_id as usize) else {
-                continue;
-            };
+        let score_one = |doc_id: u32| -> Option<(u32, u64, i64)> {
+            let slot = self.slots.get(doc_id as usize)?;
             if slot.deleted && !query.include_deleted {
-                continue;
+                return None;
             }
             if let Some(account) = &query.account_id {
                 if &slot.doc.account_id != account {
-                    continue;
+                    return None;
                 }
             }
             if let Some(mailbox) = &query.mailbox {
                 if &slot.doc.mailbox != mailbox {
-                    continue;
+                    return None;
                 }
             }
             if !query.include_deleted && slot.doc.flags & tide_core::flags::DELETED != 0 {
-                continue;
+                return None;
             }
             let score = if scored_terms.is_empty() {
                 1.0
             } else {
                 let mut value = 0.0;
                 for (source, term, idf) in &scored_terms {
-                    let (tf, weight) = match source {
+                    let (term_frequency, weight) = match source {
                         TermSource::Subject => {
                             (tf(&self.subject_terms, term, doc_id), SUBJECT_WEIGHT)
                         }
@@ -406,18 +440,29 @@ impl SearchIndex {
                             1.0,
                         ),
                     };
-                    if tf == 0 {
+                    if term_frequency == 0 {
                         continue;
                     }
                     let dl = f64::from(slot.length.max(1));
                     let denominator =
-                        f64::from(tf) + 1.2 * (1.0 - 0.75 + 0.75 * dl / avgdl.max(1.0));
-                    value += weight * idf * (f64::from(tf) * 2.2) / denominator;
+                        f64::from(term_frequency) + 1.2 * (1.0 - 0.75 + 0.75 * dl / avgdl.max(1.0));
+                    value += weight * idf * (f64::from(term_frequency) * 2.2) / denominator;
                 }
                 value
             };
-            scored.push((doc_id, (score * 1000.0).round() as u64, slot.doc.date));
-        }
+            Some((doc_id, (score * 1000.0).round() as u64, slot.doc.date))
+        };
+        let mut scored: Vec<(u32, u64, i64)> = if candidates.len() >= 4096 {
+            candidates
+                .par_iter()
+                .filter_map(|doc_id| score_one(*doc_id))
+                .collect()
+        } else {
+            candidates
+                .iter()
+                .filter_map(|doc_id| score_one(*doc_id))
+                .collect()
+        };
 
         let comparator = |left: &(u32, u64, i64), right: &(u32, u64, i64)| {
             right
@@ -481,20 +526,17 @@ fn df_for(source: TermSource, index: &SearchIndex, term: &str) -> usize {
     }
 }
 
-fn add_terms(target: &mut HashMap<String, Vec<Posting>>, doc_id: u32, tokens: &[String]) {
+fn add_terms(target: &mut Postings, doc_id: u32, tokens: &[String]) {
     let mut counts: HashMap<&str, u32> = HashMap::new();
     for token in tokens {
         *counts.entry(token.as_str()).or_insert(0) += 1;
     }
     for (term, tf) in counts {
-        target
-            .entry(term.to_string())
-            .or_default()
-            .push(Posting { doc: doc_id, tf });
+        target.push(term, Posting { doc: doc_id, tf });
     }
 }
 
-fn tf(map: &HashMap<String, Vec<Posting>>, term: &str, doc_id: u32) -> u32 {
+fn tf(map: &Postings, term: &str, doc_id: u32) -> u32 {
     map.get(term)
         .and_then(|postings| {
             postings
@@ -505,13 +547,13 @@ fn tf(map: &HashMap<String, Vec<Posting>>, term: &str, doc_id: u32) -> u32 {
         .unwrap_or(0)
 }
 
-fn docs_for(map: &HashMap<String, Vec<Posting>>, term: &str) -> HashSet<u32> {
+fn docs_for(map: &Postings, term: &str) -> HashSet<u32> {
     let mut docs = HashSet::new();
     collect_docs(map, term, &mut docs);
     docs
 }
 
-fn collect_docs(map: &HashMap<String, Vec<Posting>>, term: &str, out: &mut HashSet<u32>) {
+fn collect_docs(map: &Postings, term: &str, out: &mut HashSet<u32>) {
     if let Some(postings) = map.get(term) {
         out.extend(postings.iter().map(|posting| posting.doc));
     }
@@ -582,16 +624,36 @@ fn tokenize(value: &str) -> Vec<String> {
         if trimmed.len() < 2 || trimmed.len() > 64 || is_stopword(trimmed) {
             continue;
         }
-        let stemmed = if trimmed.chars().any(is_cyrillic) {
-            russian_stemmer().stem(trimmed).into_owned()
-        } else {
-            english_stemmer().stem(trimmed).into_owned()
-        };
+        let stemmed = stem_cached(trimmed, trimmed.chars().any(is_cyrillic));
         if !stemmed.is_empty() {
             result.push(stemmed);
         }
     }
     result
+}
+
+fn stem_cached(token: &str, cyrillic: bool) -> String {
+    static ENGLISH: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+    static RUSSIAN: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+    let cache = if cyrillic {
+        RUSSIAN.get_or_init(|| RwLock::new(HashMap::new()))
+    } else {
+        ENGLISH.get_or_init(|| RwLock::new(HashMap::new()))
+    };
+    if let Some(value) = cache.read().get(token) {
+        return value.clone();
+    }
+    let value = if cyrillic {
+        russian_stemmer().stem(token).into_owned()
+    } else {
+        english_stemmer().stem(token).into_owned()
+    };
+    let mut cache = cache.write();
+    if cache.len() > 100_000 {
+        cache.clear();
+    }
+    cache.insert(token.to_string(), value.clone());
+    value
 }
 
 fn is_cyrillic(character: char) -> bool {

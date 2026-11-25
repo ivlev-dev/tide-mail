@@ -31,6 +31,7 @@ roaring = "0.10"
 hickory-resolver = "0.26"
 mail-auth = "0.16"
 tokio = { version = "1", features = ["rt", "time", "net"] }
+rayon = "1"
 rust-stemmers = "1.2"
 x509-parser = "0.18"
 sha2 = "0.11"

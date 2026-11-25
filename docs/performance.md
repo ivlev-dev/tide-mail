@@ -19,15 +19,17 @@ cargo run --release -p tide-store --example bench
 ## Результат на тестовой машине
 
 ```text
-messages=5000 append=369ms (13550/s) snapshot=25.8ms search100=130ms hits=5000 reopen=18.5ms
+messages=5000 append=269ms (18603/s) snapshot=25ms search100=84ms hits=5000 reopen=19.9ms
+same-account concurrent messages=16000 append=488ms (32811/s) apply_pending=16000
 ```
 
 | Метрика | Значение |
 |---|---|
-| durable append | ~13 500 msg/s |
+| durable append, один поток | ~18 600 msg/s |
+| group commit, 16 потоков | ~32 800 msg/s |
 | snapshot 5k | ~25 мс |
-| поиск | ~1.3 мс/запрос |
-| reopen со снапшотом | ~18.5 мс |
+| поиск | ~0.84 мс/запрос |
+| reopen со снапшотом | ~19.9 мс |
 
 Цифры зависят от диска: `RWF_DSYNC` упирается в fsync/кэш накопителя. На NVMe результаты выше, на HDD — ниже.
 
@@ -39,6 +41,10 @@ messages=5000 append=369ms (13550/s) snapshot=25.8ms search100=130ms hits=5000 r
 4. **HTTP keep-alive.** Соединение переиспользуется для нескольких запросов вместо одного; для API это даёт кратный рост при последовательных запросах.
 5. **Snapshot без checkpoint.** Индекс пересобирался с нуля; теперь manifest + replay хвоста, reopen 18 мс.
 6. **Lane-sharded append.** Нет глобального WAL/fsync; разные аккаунты пишутся параллельно.
+7. **Group commit внутри lane.** Один `RWF_DSYNC` на пачку до 64 батчей/8 МиБ; разные lane коммитят независимо.
+8. **Отдельный apply-поток.** Индекс/каталог/change log обновляются вне I/O-потока, с переупорядочиванием по `seq`.
+9. **Bulk append.** `append_messages` группирует письма в батчи до 1000 записей — для импорта.
+10. **Postings sharding.** 16 шардов по хешу терма; поиск по кандидатам >=4096 выполняется через rayon параллельно.
 
 ## Узкие места
 
