@@ -37,6 +37,7 @@ impl RcptCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Ehlo(String),
+    Lhlo(String),
     Helo(String),
     Mail(MailCommand),
     Rcpt(RcptCommand),
@@ -62,6 +63,7 @@ impl Command {
     pub fn verb(&self) -> &'static str {
         match self {
             Self::Ehlo(_) => "EHLO",
+            Self::Lhlo(_) => "LHLO",
             Self::Helo(_) => "HELO",
             Self::Mail(_) => "MAIL",
             Self::Rcpt(_) => "RCPT",
@@ -89,6 +91,13 @@ pub fn parse_command(line: &[u8]) -> Result<Command, String> {
     let (verb, rest) = split_verb(line);
     let upper = verb.to_ascii_uppercase();
     match upper.as_str() {
+        "LHLO" => {
+            let value = rest.trim();
+            if value.is_empty() {
+                return Err("LHLO требует имя клиента".into());
+            }
+            Ok(Command::Lhlo(value.to_string()))
+        }
         "EHLO" => {
             let value = rest.trim();
             if value.is_empty() {

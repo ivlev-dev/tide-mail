@@ -15,6 +15,7 @@ pub async fn serve_smtp(
     listener: TcpListener,
     submission: bool,
     implicit_tls: bool,
+    lmtp: bool,
 ) {
     loop {
         match listener.accept().await {
@@ -22,7 +23,8 @@ pub async fn serve_smtp(
                 let app = Arc::clone(&app);
                 monoio::spawn(async move {
                     if let Err(error) =
-                        handle_connection(app, stream, submission, implicit_tls, peer.ip()).await
+                        handle_connection(app, stream, submission, implicit_tls, lmtp, peer.ip())
+                            .await
                     {
                         eprintln!("smtp {peer}: {error}");
                     }
@@ -41,6 +43,7 @@ async fn handle_connection(
     stream: TcpStream,
     submission: bool,
     implicit_tls: bool,
+    lmtp: bool,
     peer: IpAddr,
 ) -> std::io::Result<()> {
     let conn = if implicit_tls {
@@ -62,6 +65,7 @@ async fn handle_connection(
     } else {
         SmtpConfig {
             hostname: app.config.server.hostname.clone(),
+            lmtp,
             require_auth: false,
             ..SmtpConfig::default()
         }
@@ -113,8 +117,16 @@ async fn handle_connection(
                 }
                 Action::Deliver { envelope, data } => {
                     let helo = session.helo().unwrap_or("unknown").to_string();
-                    let reply = deliver(&app, submission, peer, helo, envelope, data).await;
-                    conn.write_all(&reply.to_wire()).await?;
+                    if lmtp {
+                        let replies =
+                            deliver_lmtp(&app, submission, peer, helo, envelope, data).await;
+                        for reply in replies {
+                            conn.write_all(&reply.to_wire()).await?;
+                        }
+                    } else {
+                        let reply = deliver(&app, submission, peer, helo, envelope, data).await;
+                        conn.write_all(&reply.to_wire()).await?;
+                    }
                 }
                 Action::Close => return Ok(()),
             }
@@ -158,6 +170,29 @@ fn add_trace_headers(
     out
 }
 
+async fn deliver_lmtp(
+    app: &App,
+    submission: bool,
+    peer: IpAddr,
+    helo: String,
+    envelope: tide_smtp::Envelope,
+    data: Vec<u8>,
+) -> Vec<tide_smtp::Reply> {
+    let mut replies = Vec::new();
+    for recipient in &envelope.to {
+        let mut one = envelope.clone();
+        one.to = vec![recipient.clone()];
+        one.recipients = envelope
+            .recipients
+            .iter()
+            .filter(|entry| &entry.address == recipient)
+            .cloned()
+            .collect();
+        replies.push(deliver(app, submission, peer, helo.clone(), one, data.clone()).await);
+    }
+    replies
+}
+
 async fn deliver(
     app: &App,
     submission: bool,
@@ -175,8 +210,17 @@ async fn deliver(
             let mail_from = envelope.from.clone();
             let raw = data.clone();
             let auth_helo = helo.clone();
+            let recipients = envelope.to.clone();
             let handle = monoio::spawn_blocking(move || {
-                crate::email_auth::verify(authenticator, hostname, peer, auth_helo, mail_from, raw)
+                crate::email_auth::verify(
+                    authenticator,
+                    hostname,
+                    peer,
+                    auth_helo,
+                    mail_from,
+                    recipients,
+                    raw,
+                )
             });
             match handle.await {
                 Ok(Ok(verification)) => {
@@ -188,6 +232,42 @@ async fn deliver(
                     }
                     if app.config.email_auth.reject_dmarc_fail && verification.dmarc_fail {
                         return tide_smtp::Reply::new(550, "5.7.1 DMARC policy rejection");
+                    }
+                    if let (Some(info), Some(reports)) =
+                        (verification.dmarc.clone(), app.reports.as_ref())
+                    {
+                        reports.record_dmarc(
+                            &info.domain,
+                            &info.rua,
+                            &peer.to_string(),
+                            &info.disposition,
+                            &info.dkim,
+                            &info.spf,
+                            &info.header_from,
+                            &info.policy,
+                            &info.adkim,
+                            &info.aspf,
+                        );
+                        if info.disposition != "none" && !info.ruf.is_empty() {
+                            if let Some(outbound) = app.outbound.as_ref() {
+                                let raw = crate::reporting::dmarc_failure_message(
+                                    &info,
+                                    &app.config.server.hostname,
+                                    &peer.to_string(),
+                                    &envelope.from,
+                                    &data,
+                                );
+                                for destination in &info.ruf {
+                                    let mut job = crate::outbound::OutboundQueue::job(
+                                        "",
+                                        destination.clone(),
+                                        raw.clone(),
+                                    );
+                                    job.message_id = format!("dmarc-failure-{}", peer);
+                                    let _ = outbound.enqueue(job);
+                                }
+                            }
+                        }
                     }
                     let mut augmented = verification.header.into_bytes();
                     augmented.extend_from_slice(&data);
@@ -289,6 +369,16 @@ async fn deliver(
             job.require_tls = envelope.require_tls;
             job.dsn_ret = envelope.dsn_ret.clone();
             job.envid = envelope.envid.clone();
+            if let Some(recipient_params) = envelope
+                .recipients
+                .iter()
+                .find(|entry| entry.address == *recipient)
+            {
+                job.notify = recipient_params.notify.clone();
+                job.orcpt = recipient_params.orcpt.clone();
+                job.future_release = envelope.future_release.clone();
+                job.deliver_by = envelope.deliver_by.clone();
+            }
             if !outbound.enqueue(job) {
                 return tide_smtp::Reply::new(451, "4.3.0 Outbound queue is unavailable");
             }

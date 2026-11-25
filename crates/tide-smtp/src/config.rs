@@ -24,6 +24,7 @@ impl AuthMechanism {
 #[derive(Debug, Clone)]
 pub struct SmtpConfig {
     pub hostname: String,
+    pub lmtp: bool,
     pub max_message_size: usize,
     pub max_recipients: usize,
     pub max_line_size: usize,
@@ -34,6 +35,7 @@ pub struct SmtpConfig {
     pub enable_8bitmime: bool,
     pub enable_pipelining: bool,
     pub enable_chunking: bool,
+    pub enable_binarymime: bool,
     pub enable_dsn: bool,
     pub enable_require_tls: bool,
     pub max_hops: usize,
@@ -44,6 +46,7 @@ impl Default for SmtpConfig {
     fn default() -> Self {
         Self {
             hostname: "localhost".into(),
+            lmtp: false,
             max_message_size: 25 * 1024 * 1024,
             max_recipients: 100,
             max_line_size: 4096,
@@ -54,6 +57,7 @@ impl Default for SmtpConfig {
             enable_8bitmime: true,
             enable_pipelining: true,
             enable_chunking: true,
+            enable_binarymime: true,
             enable_dsn: true,
             enable_require_tls: true,
             max_hops: 50,

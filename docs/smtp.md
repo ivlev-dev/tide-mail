@@ -9,6 +9,7 @@
 | 25 / `smtp_addr` | MX, приём почты | нет | да, если TLS настроен |
 | 587 / `submission_addr` | submission | да | да |
 | 465 / `smtps_addr` | implicit TLS | нет | не нужен |
+| 24 / `lmtp_addr` | LMTP | нет | нет |
 
 Порты задаются в `tide.toml`; в примере используются непривилегированные 2525/5870.
 
@@ -20,13 +21,31 @@
 - `MAIL FROM`, `RCPT TO`, `DATA`, `RSET`, `NOOP`, `QUIT`
 - `SIZE`, `8BITMIME`, `SMTPUTF8`, `PIPELINING`
 - `CHUNKING` / `BDAT`
+- `BINARYMIME` (только через `BDAT`)
 - `DSN`: `RET`, `ENVID`, `NOTIFY`, `ORCPT`
-- `REQUIRETLS`
+- `REQUIRETLS`, `FUTURERELEASE`, `DELIVERBY`
+- IDNA-домены и IPv4/IPv6 address literals
 - `STARTTLS`
 - `AUTH PLAIN`, `AUTH LOGIN`, cancel через `*`
 - `VRFY`, `HELP`
 - enhanced status codes
 - trace-заголовки `Received`, `Return-Path`, `Delivered-To`, loop limit
+- `LHLO` и per-recipient ответы в режиме LMTP
+- `BURL` явно отклоняется с `504`
+
+## LMTP
+
+При `lmtp_addr` сервер работает в режиме LMTP: принимает только `LHLO`, а после `DATA`/`BDAT` возвращает отдельный ответ на каждого получателя. Это удобно для локальной доставки из внешнего MTA.
+
+## Очередь и DSN
+
+- `MAIL FROM ... RET=HDRS|FULL ENVID=...` и `RCPT TO ... NOTIFY=... ORCPT=...` проверяются и сохраняются.
+- Параметры передаются следующему MTA в outbound-транзакции.
+- `RET=FULL` включает полное исходное письмо в failure DSN, иначе только заголовки.
+- `NOTIFY=SUCCESS` включает success DSN, `NOTIFY=NEVER` подавляет отчёты, `NOTIFY=FAILURE` включает только failure.
+- `FUTURERELEASE=<секунды>` удерживает письмо в очереди до указанного времени.
+- `DELIVERBY=<секунды>` задаёт дедлайн; после его истечения формируется failure DSN.
+- `REQUIRETLS` требует TLS при outbound-доставке.
 
 Ограничения: размер сообщения, число получателей, длина строки, таймауты соединения (на уровне транспорта).
 
@@ -51,6 +70,21 @@
 - Спам-движок (`[spam]`) добавляет `X-Spam-*` и маршрутизирует в `Junk`/отклоняет.
 - DSN генерируется после трёх неудачных попыток outbound; входящие DSN помечаются `X-Tide-DSN`.
 - Outbound применяет MTA-STS и DANE, если включены.
+- Ошибки TLS и MTA-STS попадают в TLS-RPT, если задан `report_dir` и `tls_rpt = true`.
+
+## DMARC и TLS-отчёты
+
+```toml
+[server]
+report_dir = "./data/reports"
+dmarc_reports = true
+tls_rpt = true
+```
+
+- Aggregate-отчёты DMARC (`rua`) формируются раз в час из `dmarc.jsonl`.
+- Failure-отчёты (`ruf`) отправляются сразу при DMARC-неудаче.
+- TLS-RPT-отчёты формируются из `tlsrpt.jsonl` и отправляются как `application/tlsrpt+json`.
+- Отчёты уходят через outbound-очередь, поэтому `outbound_enabled` должен быть включён.
 
 ## Приём
 

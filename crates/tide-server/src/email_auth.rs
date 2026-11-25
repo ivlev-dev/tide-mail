@@ -20,6 +20,21 @@ pub struct Verification {
     pub spf_fail: bool,
     pub dkim_fail: bool,
     pub dmarc_fail: bool,
+    pub dmarc: Option<DmarcInfo>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DmarcInfo {
+    pub domain: String,
+    pub rua: Vec<String>,
+    pub ruf: Vec<String>,
+    pub policy: String,
+    pub adkim: String,
+    pub aspf: String,
+    pub disposition: String,
+    pub dkim: String,
+    pub spf: String,
+    pub header_from: String,
 }
 
 pub fn verify(
@@ -28,6 +43,7 @@ pub fn verify(
     peer: IpAddr,
     helo: String,
     mail_from: String,
+    recipients: Vec<String>,
     raw: Vec<u8>,
 ) -> Result<Verification, String> {
     let runtime = Builder::new_current_thread()
@@ -50,28 +66,72 @@ pub fn verify(
                     .map(|(_, domain)| domain)
             })
             .unwrap_or("");
+        let arc = authenticator.verify_arc(&message).await;
+        let dkim2 = authenticator
+            .verify_dkim2(
+                &message,
+                mail_auth::dkim2::Envelope::new(mail_from.clone(), recipients),
+            )
+            .await;
         let dmarc = if mail_from_domain.is_empty() {
             None
         } else {
             Some(
                 authenticator
-                    .verify_dmarc(DmarcParameters::new(
-                        &message,
-                        &dkim,
-                        mail_from_domain,
-                        &spf,
-                    ))
+                    .verify_dmarc(
+                        DmarcParameters::new(&message, &dkim, mail_from_domain, &spf)
+                            .with_dkim2_output(&dkim2),
+                    )
                     .await,
             )
         };
         let mut header = AuthenticationResults::new(&hostname)
             .with_dkim_results(&dkim, message.first_from_address())
             .with_spf_result(&spf, &spf_params);
+        header = header.with_arc_result(&arc, peer);
+        let dkim2_label = match dkim2.result() {
+            mail_auth::dkim2::output::Dkim2Result::Pass => "pass",
+            mail_auth::dkim2::output::Dkim2Result::Fail(_) => "fail",
+            mail_auth::dkim2::output::Dkim2Result::PermError(_) => "permerror",
+            mail_auth::dkim2::output::Dkim2Result::TempError(_) => "temperror",
+            mail_auth::dkim2::output::Dkim2Result::None => "none",
+        };
+        let dmarc_info = dmarc.as_ref().and_then(|output| {
+            let record = output.record()?;
+            let header_from = message
+                .first_from_address()
+                .rsplit_once('@')
+                .map(|(_, domain)| domain.to_string())
+                .unwrap_or_else(|| mail_from_domain.to_string());
+            let disposition = match output.result() {
+                DmarcResult::Pass
+                | DmarcResult::None
+                | DmarcResult::TempError(_)
+                | DmarcResult::PermError(_) => "none".to_string(),
+                DmarcResult::Fail(_) => record.p.to_string(),
+            };
+            Some(DmarcInfo {
+                domain: output.domain().to_string(),
+                rua: record.rua.iter().map(|uri| uri.uri().to_string()).collect(),
+                ruf: record.ruf.iter().map(|uri| uri.uri().to_string()).collect(),
+                policy: record.p.to_string(),
+                adkim: record.adkim.to_string(),
+                aspf: record.aspf.to_string(),
+                disposition,
+                dkim: result_label(output.dkim_result()),
+                spf: result_label(output.spf_result()),
+                header_from,
+            })
+        });
         if let Some(dmarc) = dmarc.as_ref() {
             header = header.with_dmarc_result(dmarc);
         }
+        let mut rendered = header.to_header();
+        if dkim2_label != "none" {
+            rendered.push_str(&format!("\r\nAuthentication-Results-DKIM2: {dkim2_label}"));
+        }
         Ok(Verification {
-            header: header.to_header(),
+            header: rendered,
             spf_fail: matches!(spf.result(), SpfResult::Fail | SpfResult::SoftFail),
             dkim_fail: !dkim
                 .iter()
@@ -83,6 +143,7 @@ pub fn verify(
                         && matches!(output.policy(), mail_auth::dmarc::Policy::Reject)
                 })
                 .unwrap_or(false),
+            dmarc: dmarc_info,
         })
     })
 }
@@ -116,6 +177,16 @@ pub fn sign_dkim(settings: &DkimSettings, raw: &[u8]) -> Result<Vec<u8>, String>
     let mut signed = signature.to_header().into_bytes();
     signed.extend_from_slice(raw);
     Ok(signed)
+}
+
+fn result_label(result: &DmarcResult) -> String {
+    match result {
+        DmarcResult::Pass => "pass".to_string(),
+        DmarcResult::Fail(_) => "fail".to_string(),
+        DmarcResult::TempError(_) => "temperror".to_string(),
+        DmarcResult::PermError(_) => "permerror".to_string(),
+        DmarcResult::None => "none".to_string(),
+    }
 }
 
 #[cfg(test)]

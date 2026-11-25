@@ -1,6 +1,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use crate::address::validate_address;
 use crate::command::{Command, parse_command};
 use crate::config::{AuthMechanism, SmtpConfig};
 use crate::reply::Reply;
@@ -20,9 +21,13 @@ pub struct Envelope {
     pub size: Option<u64>,
     pub smtputf8: bool,
     pub body_8bitmime: bool,
+    pub body_binarymime: bool,
     pub dsn_ret: Option<String>,
     pub envid: Option<String>,
     pub require_tls: bool,
+    pub future_release: Option<String>,
+    pub deliver_by: Option<String>,
+    pub burl: Option<String>,
 }
 
 impl Envelope {
@@ -34,9 +39,13 @@ impl Envelope {
             size: None,
             smtputf8: false,
             body_8bitmime: false,
+            body_binarymime: false,
             dsn_ret: None,
             envid: None,
             require_tls: false,
+            future_release: None,
+            deliver_by: None,
+            burl: None,
         }
     }
 }
@@ -89,7 +98,14 @@ pub struct SmtpSession {
 
 impl SmtpSession {
     pub fn new(config: SmtpConfig) -> (Self, Reply) {
-        let greeting = Reply::new(220, format!("{} ESMTP Tide Mail", config.hostname));
+        let greeting = Reply::new(
+            220,
+            if config.lmtp {
+                format!("{} LMTP Tide Mail", config.hostname)
+            } else {
+                format!("{} ESMTP Tide Mail", config.hostname)
+            },
+        );
         let session = Self {
             config,
             state: State::Command,
@@ -199,13 +215,8 @@ impl SmtpSession {
             Err(error) => return vec![Action::Reply(Reply::new(501, error))],
         };
         match command {
-            Command::Ehlo(name) => {
-                if self.helo.is_some() {
-                    self.envelope = None;
-                }
-                self.helo = Some(name);
-                vec![Action::Reply(self.ehlo_reply())]
-            }
+            Command::Ehlo(name) => self.hello(name, false),
+            Command::Lhlo(name) => self.hello(name, true),
             Command::Helo(name) => {
                 self.helo = Some(name);
                 self.envelope = None;
@@ -252,12 +263,15 @@ impl SmtpSession {
                         "5.5.4 SMTPUTF8 is not supported",
                     ))];
                 }
-                if !smtputf8 && !mail.from.is_ascii() {
-                    return vec![Action::Reply(Reply::new(
-                        553,
-                        "5.6.7 SMTPUTF8 is required for this address",
-                    ))];
-                }
+                let from = match validate_address(&mail.from, smtputf8) {
+                    Ok(from) => from,
+                    Err(error) => {
+                        return vec![Action::Reply(Reply::new(
+                            553,
+                            format!("5.1.7 Invalid sender address: {error}"),
+                        ))];
+                    }
+                };
                 let dsn_ret = mail.param("RET").map(str::to_ascii_uppercase);
                 if let Some(ret) = &dsn_ret {
                     if !self.config.enable_dsn || !matches!(ret.as_str(), "HDRS" | "FULL") {
@@ -269,29 +283,48 @@ impl SmtpSession {
                 }
                 let envid = mail.param("ENVID").map(str::to_string);
                 let require_tls = mail.has_param("REQUIRETLS");
+                let future_release = mail.param("FUTURERELEASE").map(str::to_string);
+                let deliver_by = mail.param("DELIVERBY").map(str::to_string);
+                if mail.has_param("BURL") {
+                    return vec![Action::Reply(Reply::new(
+                        504,
+                        "5.5.4 BURL is not supported",
+                    ))];
+                }
                 if require_tls && !self.config.enable_require_tls {
                     return vec![Action::Reply(Reply::new(
                         504,
                         "5.5.4 REQUIRETLS is not supported",
                     ))];
                 }
-                let body_8bitmime = mail
-                    .param("BODY")
-                    .map(|value| value.eq_ignore_ascii_case("8BITMIME"))
-                    .unwrap_or(false);
+                let body = mail.param("BODY").map(str::to_ascii_uppercase);
+                let body_8bitmime = body.as_deref() == Some("8BITMIME");
+                let body_binarymime = body.as_deref() == Some("BINARYMIME");
                 if body_8bitmime && !self.config.enable_8bitmime {
                     return vec![Action::Reply(Reply::new(
                         504,
                         "5.5.4 8BITMIME is not supported",
                     ))];
                 }
-                let mut envelope = Envelope::new(mail.from);
+                if body_binarymime
+                    && (!self.config.enable_binarymime || !self.config.enable_chunking)
+                {
+                    return vec![Action::Reply(Reply::new(
+                        504,
+                        "5.5.4 BINARYMIME is not supported",
+                    ))];
+                }
+                let mut envelope = Envelope::new(from);
                 envelope.size = size;
                 envelope.smtputf8 = smtputf8;
                 envelope.body_8bitmime = body_8bitmime;
+                envelope.body_binarymime = body_binarymime;
                 envelope.dsn_ret = dsn_ret;
                 envelope.envid = envid;
                 envelope.require_tls = require_tls;
+                envelope.future_release = future_release;
+                envelope.deliver_by = deliver_by;
+                envelope.burl = None;
                 self.envelope = Some(envelope);
                 self.bdat_active = false;
                 self.data.clear();
@@ -308,12 +341,15 @@ impl SmtpSession {
                     ))];
                 }
                 let envelope = self.envelope.as_mut().expect("checked above");
-                if !envelope.smtputf8 && !rcpt.to.is_ascii() {
-                    return vec![Action::Reply(Reply::new(
-                        553,
-                        "5.6.7 SMTPUTF8 is required for this address",
-                    ))];
-                }
+                let recipient = match validate_address(&rcpt.to, envelope.smtputf8) {
+                    Ok(recipient) => recipient,
+                    Err(error) => {
+                        return vec![Action::Reply(Reply::new(
+                            553,
+                            format!("5.1.3 Invalid recipient address: {error}"),
+                        ))];
+                    }
+                };
                 if envelope.to.len() >= self.config.max_recipients {
                     return vec![Action::Reply(Reply::new(452, "4.5.3 Too many recipients"))];
                 }
@@ -331,9 +367,9 @@ impl SmtpSession {
                     }
                 }
                 let orcpt = rcpt.param("ORCPT").map(str::to_string);
-                envelope.to.push(rcpt.to.clone());
+                envelope.to.push(recipient.clone());
                 envelope.recipients.push(Recipient {
-                    address: rcpt.to,
+                    address: recipient,
                     notify,
                     orcpt,
                 });
@@ -373,6 +409,12 @@ impl SmtpSession {
                 };
                 if envelope.to.is_empty() {
                     return vec![Action::Reply(Reply::new(503, "5.5.1 Send RCPT first"))];
+                }
+                if envelope.body_binarymime {
+                    return vec![Action::Reply(Reply::new(
+                        503,
+                        "5.5.1 BINARYMIME requires BDAT",
+                    ))];
                 }
                 self.state = State::Data;
                 self.data.clear();
@@ -429,6 +471,24 @@ impl SmtpSession {
         }
     }
 
+    fn hello(&mut self, name: String, lhlo: bool) -> Vec<Action> {
+        if self.config.lmtp != lhlo {
+            return vec![Action::Reply(Reply::new(
+                500,
+                if self.config.lmtp {
+                    "5.5.2 Use LHLO with LMTP"
+                } else {
+                    "5.5.2 Use EHLO with SMTP"
+                },
+            ))];
+        }
+        if self.helo.is_some() {
+            self.envelope = None;
+        }
+        self.helo = Some(name);
+        vec![Action::Reply(self.ehlo_reply())]
+    }
+
     fn require_helo(&self) -> bool {
         self.helo.is_some()
     }
@@ -448,12 +508,17 @@ impl SmtpSession {
         if self.config.enable_chunking {
             lines.push("CHUNKING".into());
         }
+        if self.config.enable_binarymime && self.config.enable_chunking {
+            lines.push("BINARYMIME".into());
+        }
         if self.config.enable_dsn {
             lines.push("DSN".into());
         }
         if self.config.enable_require_tls {
             lines.push("REQUIRETLS".into());
         }
+        lines.push("FUTURERELEASE".into());
+        lines.push("DELIVERBY".into());
         if self.config.enable_starttls && !self.tls_active {
             lines.push("STARTTLS".into());
         }
@@ -735,7 +800,15 @@ mod tests {
         let mut session = session();
         let actions = session.feed_line(b"EHLO client");
         let reply = &replies(&actions)[0];
-        for capability in ["CHUNKING", "DSN", "REQUIRETLS", "SMTPUTF8"] {
+        for capability in [
+            "CHUNKING",
+            "DSN",
+            "REQUIRETLS",
+            "SMTPUTF8",
+            "BINARYMIME",
+            "FUTURERELEASE",
+            "DELIVERBY",
+        ] {
             assert!(
                 reply.lines.iter().any(|line| line == capability),
                 "{capability}"
@@ -762,6 +835,51 @@ mod tests {
             Action::Deliver { data, .. } => assert_eq!(data, b"hello"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_burl() {
+        let mut session = session();
+        session.feed_line(b"EHLO client");
+        let actions =
+            session.feed_line(b"MAIL FROM:<a@example.com> BURL=https://example.com/message");
+        assert_eq!(replies(&actions)[0].code, 504);
+    }
+
+    #[test]
+    fn parses_release_and_deadline() {
+        let mut session = session();
+        session.feed_line(b"EHLO client");
+        assert_eq!(
+            replies(
+                &session.feed_line(b"MAIL FROM:<a@example.com> FUTURERELEASE=3600 DELIVERBY=86400")
+            )[0]
+            .code,
+            250
+        );
+        let envelope = session.envelope.as_ref().unwrap();
+        assert_eq!(envelope.future_release.as_deref(), Some("3600"));
+        assert_eq!(envelope.deliver_by.as_deref(), Some("86400"));
+    }
+
+    #[test]
+    fn binarymime_requires_bdat() {
+        let mut session = session();
+        session.feed_line(b"EHLO client");
+        session.feed_line(b"MAIL FROM:<a@example.com> BODY=BINARYMIME");
+        session.feed_line(b"RCPT TO:<b@example.com>");
+        let actions = session.feed_line(b"DATA");
+        assert_eq!(replies(&actions)[0].code, 503);
+        let actions = session.feed_line(b"BDAT 4 LAST");
+        assert_eq!(
+            actions[0],
+            Action::ReadBdat {
+                size: 4,
+                last: true
+            }
+        );
+        let actions = session.feed_bdat_chunk(b"\0\x01\x02\x03", true);
+        assert!(matches!(actions[0], Action::Deliver { .. }));
     }
 
     #[test]
@@ -798,6 +916,22 @@ mod tests {
         assert_eq!(replies(&actions)[0].code, 553);
         let actions = session.feed_line("MAIL FROM:<юзер@example.com> SMTPUTF8".as_bytes());
         assert_eq!(replies(&actions)[0].code, 250);
+    }
+
+    #[test]
+    fn lmtp_uses_lhlo() {
+        let (mut session, greeting) = SmtpSession::new(SmtpConfig {
+            lmtp: true,
+            ..SmtpConfig::default()
+        });
+        assert!(greeting.lines[0].contains("LMTP"));
+        assert_eq!(replies(&session.feed_line(b"EHLO client"))[0].code, 500);
+        assert_eq!(replies(&session.feed_line(b"LHLO client"))[0].code, 250);
+        session.feed_line(b"MAIL FROM:<a@example.com>");
+        session.feed_line(b"RCPT TO:<b@example.com>");
+        session.feed_line(b"DATA");
+        session.feed_line(b"hello");
+        assert!(matches!(session.feed_line(b".")[0], Action::Deliver { .. }));
     }
 
     #[test]

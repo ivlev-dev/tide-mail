@@ -53,6 +53,7 @@ pub fn build_failure_dsn(job: &OutboundJob, hostname: &str, reason: &str) -> Vec
             "Reporting-MTA: dns; {hostname}\r\n\
              X-Tide-Queue-ID: {}\r\n\r\n\
              Final-Recipient: rfc822; {}\r\n\
+             {}\
              Action: failed\r\n\
              Status: 5.0.0\r\n\
              Diagnostic-Code: smtp; {reason}\r\n\
@@ -60,6 +61,10 @@ pub fn build_failure_dsn(job: &OutboundJob, hostname: &str, reason: &str) -> Vec
              ",
             job.id,
             job.to,
+            job.orcpt
+                .as_ref()
+                .map(|orcpt| format!("Original-Recipient: {orcpt}\r\n"))
+                .unwrap_or_default(),
             job.envid
                 .as_ref()
                 .map(|envid| format!("Original-Envelope-Id: {envid}\r\n"))
@@ -67,16 +72,87 @@ pub fn build_failure_dsn(job: &OutboundJob, hostname: &str, reason: &str) -> Vec
         )
         .as_bytes(),
     );
+    let full = job.dsn_ret.as_deref() == Some("FULL");
+    if full {
+        out.extend_from_slice(
+            format!("\r\n--{boundary}\r\nContent-Type: message/rfc822\r\n\r\n").as_bytes(),
+        );
+        out.extend_from_slice(&job.raw);
+        out.extend_from_slice(format!("\r\n\r\n--{boundary}--\r\n").as_bytes());
+    } else {
+        out.extend_from_slice(
+            format!("\r\n--{boundary}\r\nContent-Type: text/rfc822-headers\r\n\r\n").as_bytes(),
+        );
+        let headers_end = job
+            .raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap_or(job.raw.len().min(4096));
+        out.extend_from_slice(&job.raw[..headers_end]);
+        out.extend_from_slice(format!("\r\n\r\n--{boundary}--\r\n").as_bytes());
+    }
+    out
+}
+
+pub fn build_success_dsn(job: &OutboundJob, hostname: &str) -> Vec<u8> {
+    let now = now_millis() / 1000;
+    let date = mail_parser::DateTime::from_timestamp(now).to_rfc822();
+    let boundary = format!("----tide-dsn-ok-{now}");
+    let message_id = if job.message_id.is_empty() {
+        "<unknown@tide>".to_string()
+    } else {
+        format!("<{}@tide>", job.message_id)
+    };
+    let mut out = Vec::new();
     out.extend_from_slice(
-        format!("\r\n--{boundary}\r\nContent-Type: text/rfc822-headers\r\n\r\n").as_bytes(),
+        format!(
+            "From: Mail Delivery System <MAILER-DAEMON@{hostname}>\r\n\
+             To: <{}>\r\n\
+             Subject: Delivery Status Notification (Success)\r\n\
+             Date: {date}\r\n\
+             Message-ID: <dsn-ok-{now}@tide>\r\n\
+             Auto-Submitted: auto-replied\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/report; report-type=delivery-status; boundary=\"{boundary}\"\r\n\r\n",
+            job.from
+        )
+        .as_bytes(),
     );
-    let headers_end = job
-        .raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .unwrap_or(job.raw.len().min(4096));
-    out.extend_from_slice(&job.raw[..headers_end]);
-    out.extend_from_slice(format!("\r\n\r\n--{boundary}--\r\n").as_bytes());
+    out.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n\
+             Delivery to the following recipient succeeded:\n\n    {}\n",
+            job.to
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(
+        format!("\r\n--{boundary}\r\nContent-Type: message/delivery-status\r\n\r\n").as_bytes(),
+    );
+    out.extend_from_slice(
+        format!(
+            "Reporting-MTA: dns; {hostname}\r\n\
+             X-Tide-Queue-ID: {}\r\n\r\n\
+             Final-Recipient: rfc822; {}\r\n\
+             {}\
+             {}\
+             Action: delivered\r\n\
+             Status: 2.0.0\r\n\
+             Original-Message-ID: {message_id}\r\n",
+            job.id,
+            job.to,
+            job.orcpt
+                .as_ref()
+                .map(|orcpt| format!("Original-Recipient: {orcpt}\r\n"))
+                .unwrap_or_default(),
+            job.envid
+                .as_ref()
+                .map(|envid| format!("Original-Envelope-Id: {envid}\r\n"))
+                .unwrap_or_default()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     out
 }
 
@@ -103,7 +179,36 @@ mod tests {
             require_tls: false,
             dsn_ret: None,
             envid: None,
+            notify: None,
+            orcpt: None,
+            future_release: None,
+            deliver_by: None,
+            created_at: 0,
         }
+    }
+
+    #[test]
+    fn includes_envelope_and_full_body() {
+        let mut job = job();
+        job.dsn_ret = Some("FULL".into());
+        job.envid = Some("env-1".into());
+        job.orcpt = Some("rfc822;bob@example.com".into());
+        let dsn = build_failure_dsn(&job, "mail.local", "timeout");
+        let text = String::from_utf8_lossy(&dsn);
+        assert!(text.contains("Original-Envelope-Id: env-1"));
+        assert!(text.contains("Original-Recipient: rfc822;bob@example.com"));
+        assert!(text.contains("Content-Type: message/rfc822"));
+        assert!(text.contains("body"));
+    }
+
+    #[test]
+    fn builds_success_dsn() {
+        let mut job = job();
+        job.notify = Some("SUCCESS".into());
+        let dsn = build_success_dsn(&job, "mail.local");
+        let text = String::from_utf8_lossy(&dsn);
+        assert!(text.contains("Action: delivered"));
+        assert!(text.contains("Status: 2.0.0"));
     }
 
     #[test]

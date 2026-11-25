@@ -185,27 +185,56 @@ pub fn lookup_dane(host: &str) -> Result<Vec<DaneRecord>, String> {
         .collect())
 }
 
+#[cfg(test)]
 pub fn dane_matches(records: &[DaneRecord], certificate: &[u8]) -> bool {
+    dane_chain_matches(records, &[certificate])
+}
+
+pub fn dane_chain_matches(records: &[DaneRecord], certificates: &[&[u8]]) -> bool {
     use sha2::{Digest, Sha256};
     use x509_parser::parse_x509_certificate;
-    let Ok((_, parsed)) = parse_x509_certificate(certificate) else {
-        return false;
-    };
     for record in records {
-        if record.usage != 3 || record.matching != 1 {
+        if !matches!(record.usage, 2 | 3) {
             continue;
         }
-        let material = match record.selector {
-            0 => certificate,
-            1 => parsed.tbs_certificate.subject_pki.raw,
-            _ => continue,
+        let candidates: &[&[u8]] = if record.usage == 3 {
+            &certificates[..certificates.len().min(1)]
+        } else {
+            certificates
         };
-        let digest = Sha256::digest(material);
-        if digest.as_slice() == record.data.as_slice() {
-            return true;
+        for certificate in candidates {
+            let Ok((_, parsed)) = parse_x509_certificate(certificate) else {
+                continue;
+            };
+            let material = match record.selector {
+                0 => *certificate,
+                1 => parsed.tbs_certificate.subject_pki.raw,
+                _ => continue,
+            };
+            let matches = match record.matching {
+                0 => material == record.data.as_slice(),
+                1 => Sha256::digest(material).as_slice() == record.data.as_slice(),
+                _ => false,
+            };
+            if matches {
+                return true;
+            }
         }
     }
     false
+}
+
+#[allow(dead_code)]
+pub fn tls_rpt_policy(domain: &str) -> Option<String> {
+    let txt = lookup_txt(&format!("_smtp._tls.{domain}")).ok()?;
+    txt.into_iter().find_map(|value| {
+        if !value.contains("v=TLSRPTv1") {
+            return None;
+        }
+        value
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("rua=").map(str::to_string))
+    })
 }
 
 #[derive(Debug)]
@@ -223,7 +252,9 @@ impl rustls::client::danger::ServerCertVerifier for DaneVerifier {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if dane_matches(&self.records, end_entity.as_ref()) {
+        let mut chain = vec![end_entity.as_ref()];
+        chain.extend(_intermediates.iter().map(|cert| cert.as_ref()));
+        if dane_chain_matches(&self.records, &chain) {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General("DANE TLSA mismatch".into()))

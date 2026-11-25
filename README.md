@@ -45,6 +45,7 @@ http_addr = "127.0.0.1:8080"
 http_tls = false
 smtp_addr = "127.0.0.1:2525"
 smtps_addr = "127.0.0.1:4650"
+# lmtp_addr = "127.0.0.1:2424"
 submission_addr = "127.0.0.1:5870"
 sync_addr = "127.0.0.1:9093"
 token_ttl_hours = 168
@@ -54,6 +55,9 @@ dsn_enabled = true
 mta_sts = true
 dane = false
 admin_token = "change-admin-token"
+# report_dir = "./data/reports"
+dmarc_reports = true
+tls_rpt = true
 
 [tls]
 self_signed = true
@@ -89,9 +93,11 @@ docker compose up --build
 
 ## SMTP
 
-- Порты 25/465/587 (в примере 2525/4650/5870), implicit TLS, STARTTLS, AUTH PLAIN/LOGIN.
-- ESMTP: SIZE, 8BITMIME, SMTPUTF8, PIPELINING.
-- Входящие SPF/DKIM/DMARC, исходящие DKIM + opportunistic TLS + MX.
+- Порты 25/465/587 (в примере 2525/4650/5870), LMTP, implicit TLS, STARTTLS, AUTH PLAIN/LOGIN.
+- ESMTP: SIZE, 8BITMIME, SMTPUTF8, PIPELINING, CHUNKING/BDAT, BINARYMIME, DSN, REQUIRETLS, FUTURERELEASE, DELIVERBY.
+- Trace-заголовки, IDNA, address literals, отклонение BURL.
+- Входящие SPF/DKIM/DMARC/ARC/DKIM2, исходящие DKIM + opportunistic TLS + MTA-STS + DANE.
+- DMARC aggregate/failure reports и TLS-RPT через outbound-очередь.
 - Входящие письма маршрутизируются локальным аккаунтам, парсятся и индексируются.
 - Submission с внешними получателями ставит письма в outbound-очередь (если `outbound_enabled`).
 

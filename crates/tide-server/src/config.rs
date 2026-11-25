@@ -37,6 +37,14 @@ pub struct ServerSettings {
     pub smtp_addr: Option<String>,
     #[serde(default)]
     pub smtps_addr: Option<String>,
+    #[serde(default)]
+    pub lmtp_addr: Option<String>,
+    #[serde(default)]
+    pub report_dir: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    pub dmarc_reports: bool,
+    #[serde(default = "default_true")]
+    pub tls_rpt: bool,
     pub submission_addr: Option<String>,
     pub sync_addr: Option<String>,
     pub token_ttl_hours: u64,
@@ -96,6 +104,10 @@ impl Default for ServerSettings {
             http_tls: false,
             smtp_addr: Some("127.0.0.1:2525".into()),
             smtps_addr: None,
+            lmtp_addr: None,
+            report_dir: None,
+            dmarc_reports: true,
+            tls_rpt: true,
             submission_addr: Some("127.0.0.1:5870".into()),
             sync_addr: Some("127.0.0.1:9093".into()),
             token_ttl_hours: 24 * 7,
@@ -251,6 +263,9 @@ impl Config {
         if self.server.smtp_addr.as_deref() == Some("") {
             self.server.smtp_addr = None;
         }
+        if self.server.lmtp_addr.as_deref() == Some("") {
+            self.server.lmtp_addr = None;
+        }
         if self.server.smtps_addr.as_deref() == Some("") {
             self.server.smtps_addr = None;
         }
@@ -334,6 +349,8 @@ http_addr = "127.0.0.1:8080"
 http_tls = false
 smtp_addr = "127.0.0.1:2525"
 # smtps_addr = "127.0.0.1:4650"
+# lmtp_addr = "127.0.0.1:2424"
+# report_dir = "./data/reports"
 submission_addr = "127.0.0.1:5870"
 sync_addr = "127.0.0.1:9093"
 token_ttl_hours = 168

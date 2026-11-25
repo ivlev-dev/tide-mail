@@ -8,6 +8,7 @@ mod http;
 mod mime_build;
 mod net;
 mod outbound;
+mod reporting;
 mod scan_queue;
 mod smtp;
 mod sync_server;
@@ -150,6 +151,21 @@ fn main() {
     } else {
         None
     };
+    let reports = if config.server.dmarc_reports || config.server.tls_rpt {
+        let dir = config
+            .server
+            .report_dir
+            .clone()
+            .unwrap_or_else(|| config.server.data_path.with_file_name("reports"));
+        Some(reporting::Reports::new(
+            dir,
+            config.server.hostname.clone(),
+            config.server.dmarc_reports,
+            config.server.tls_rpt,
+        ))
+    } else {
+        None
+    };
     let outbound = if config.server.outbound_enabled {
         let outbound_dir = config
             .server
@@ -164,6 +180,7 @@ fn main() {
             config.server.dsn_enabled,
             tls_policy::MtaStsCache::new(config.server.mta_sts),
             config.server.dane,
+            reports.clone(),
         ))
     } else {
         None
@@ -178,6 +195,7 @@ fn main() {
         spam,
         antivirus,
         scan_queue,
+        reports,
     );
 
     println!(
@@ -192,6 +210,9 @@ fn main() {
     }
     if let Some(address) = &config.server.smtps_addr {
         println!("  SMTPS {address}");
+    }
+    if let Some(address) = &config.server.lmtp_addr {
+        println!("  LMTP  {address}");
     }
     if let Some(address) = &config.server.submission_addr {
         println!("  SUB   {address}");
@@ -239,7 +260,7 @@ fn run_worker(app: Arc<App>, worker_index: usize) {
             match TcpListener::bind_with_config(address, &options) {
                 Ok(listener) => {
                     let app = Arc::clone(&app);
-                    monoio::spawn(smtp::serve_smtp(app, listener, false, false));
+                    monoio::spawn(smtp::serve_smtp(app, listener, false, false, false));
                 }
                 Err(error) => eprintln!("smtp bind {address}: {error}"),
             }
@@ -248,7 +269,7 @@ fn run_worker(app: Arc<App>, worker_index: usize) {
             match TcpListener::bind_with_config(address, &options) {
                 Ok(listener) => {
                     let app = Arc::clone(&app);
-                    monoio::spawn(smtp::serve_smtp(app, listener, true, false));
+                    monoio::spawn(smtp::serve_smtp(app, listener, true, false, false));
                 }
                 Err(error) => eprintln!("submission bind {address}: {error}"),
             }
@@ -258,9 +279,19 @@ fn run_worker(app: Arc<App>, worker_index: usize) {
             match TcpListener::bind_with_config(&address, &options) {
                 Ok(listener) => {
                     let app = Arc::clone(&app);
-                    monoio::spawn(smtp::serve_smtp(app, listener, false, true));
+                    monoio::spawn(smtp::serve_smtp(app, listener, false, true, false));
                 }
                 Err(error) => eprintln!("smtps bind {address}: {error}"),
+            }
+        }
+        if let Some(address) = &app.config.server.lmtp_addr {
+            let address = address.clone();
+            match TcpListener::bind_with_config(&address, &options) {
+                Ok(listener) => {
+                    let app = Arc::clone(&app);
+                    monoio::spawn(smtp::serve_smtp(app, listener, false, false, true));
+                }
+                Err(error) => eprintln!("lmtp bind {address}: {error}"),
             }
         }
         if let Some(address) = &app.config.server.sync_addr {
@@ -271,6 +302,11 @@ fn run_worker(app: Arc<App>, worker_index: usize) {
                     monoio::spawn(sync_server::serve_sync(app, listener, use_tls));
                 }
                 Err(error) => eprintln!("sync bind {address}: {error}"),
+            }
+        }
+        if worker_index == 0 {
+            if let (Some(reports), Some(outbound)) = (app.reports.clone(), app.outbound.clone()) {
+                reports.spawn_flusher(outbound, std::time::Duration::from_secs(3600));
             }
         }
         if worker_index == 0 && app.config.server.snapshot_interval_secs > 0 {
