@@ -615,7 +615,11 @@ impl SmtpSession {
             lines.push("DELIVERBY".into());
         }
         if self.config.enable_burl {
-            lines.push("BURL https".into());
+            if self.config.enable_burl_imap {
+                lines.push("BURL https imap".into());
+            } else {
+                lines.push("BURL https".into());
+            }
         }
         if self.config.enable_starttls && !self.tls_active {
             lines.push("STARTTLS".into());

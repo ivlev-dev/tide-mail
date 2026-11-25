@@ -20,6 +20,8 @@ pub struct Config {
     pub antivirus: AntivirusSettings,
     #[serde(default)]
     pub blob: BlobSettings,
+    #[serde(default)]
+    pub burl: BurlSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +137,39 @@ pub struct EmailAuthSettings {
     pub reject_spf_fail: bool,
     #[serde(default)]
     pub reject_dmarc_fail: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BurlSettings {
+    #[serde(default)]
+    pub imap_enabled: bool,
+    #[serde(default)]
+    pub imap_hosts: Vec<String>,
+    #[serde(default)]
+    pub imap_user: String,
+    #[serde(default)]
+    pub imap_password: String,
+    #[serde(default = "default_imap_port")]
+    pub imap_port: u16,
+    #[serde(default)]
+    pub imap_starttls: bool,
+}
+
+fn default_imap_port() -> u16 {
+    993
+}
+
+impl Default for BurlSettings {
+    fn default() -> Self {
+        Self {
+            imap_enabled: false,
+            imap_hosts: Vec::new(),
+            imap_user: String::new(),
+            imap_password: String::new(),
+            imap_port: 993,
+            imap_starttls: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -408,6 +443,14 @@ threshold = 5.0
 reject_threshold = 15.0
 # dnsbl_zones = ["zen.spamhaus.org"]
 # external_command = "spamassassin"
+
+[burl]
+# imap_enabled = false
+# imap_hosts = ["imap.example.com"]
+# imap_user = "submit"
+# imap_password = "change-me"
+# imap_port = 993
+# imap_starttls = false
 
 [dkim]
 # domain = "mail.local"

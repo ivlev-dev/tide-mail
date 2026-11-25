@@ -72,6 +72,12 @@ enabled = true
 threshold = 5.0
 reject_threshold = 15.0
 
+[burl]
+# imap_enabled = true
+# imap_hosts = ["imap.example.com"]
+# imap_user = "submit"
+# imap_password = "change-me"
+
 [dkim]
 # domain = "mail.local"
 # selector = "default"
@@ -98,7 +104,7 @@ docker compose up --build
 ## SMTP
 
 - Порты 25/465/587 (в примере 2525/4650/5870), LMTP, implicit TLS, STARTTLS, AUTH PLAIN/LOGIN.
-- ESMTP: SIZE, 8BITMIME, SMTPUTF8, PIPELINING, CHUNKING/BDAT, BINARYMIME, DSN, REQUIRETLS, FUTURERELEASE, DELIVERBY, BURL (HTTPS).
+- ESMTP: SIZE, 8BITMIME, SMTPUTF8, PIPELINING, CHUNKING/BDAT, BINARYMIME, DSN, REQUIRETLS, FUTURERELEASE, DELIVERBY, BURL (HTTPS/IMAP).
 - Trace-заголовки, IDNA, address literals, SSRF-защита BURL.
 - Входящие SPF/DKIM/DMARC/ARC/DKIM2, исходящие DKIM/ARC/DKIM2 + opportunistic TLS + MTA-STS + DANE.
 - DMARC aggregate/failure reports с `pct` и external destination verification, TLS-RPT с успешными и неуспешными сессиями.

@@ -6,6 +6,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::time::Duration;
 
 use hickory_resolver::Resolver;
+use mail_auth::MessageAuthenticator;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,7 @@ impl OutboundQueue {
         mta_sts: Arc<MtaStsCache>,
         dane: bool,
         reports: Option<Arc<Reports>>,
+        authenticator: Option<Arc<MessageAuthenticator>>,
     ) -> Arc<Self> {
         let dir = dir.into();
         let _ = fs::create_dir_all(&dir);
@@ -94,6 +96,7 @@ impl OutboundQueue {
                         &policy,
                         dane,
                         reports.as_ref(),
+                        authenticator.as_ref(),
                         &job,
                     );
                 }
@@ -108,6 +111,7 @@ impl OutboundQueue {
                         &policy,
                         dane,
                         reports.as_ref(),
+                        authenticator.as_ref(),
                         &job,
                     );
                 }
@@ -213,6 +217,7 @@ fn deliver_with_retry(
     policy: &Arc<MtaStsCache>,
     dane: bool,
     reports: Option<&Arc<Reports>>,
+    authenticator: Option<&Arc<MessageAuthenticator>>,
     job: &OutboundJob,
 ) {
     let now = now_secs();
@@ -252,6 +257,7 @@ fn deliver_with_retry(
             &job.from,
             std::slice::from_ref(&job.to),
             &job.raw,
+            authenticator,
         )
         .unwrap_or_else(|error| {
             eprintln!("outbound signing {} -> {}: {error}", job.from, job.to);

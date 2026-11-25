@@ -178,9 +178,13 @@ fn main() {
             dkim.clone(),
             config.server.outbound_tls,
             config.server.dsn_enabled,
-            tls_policy::MtaStsCache::new(config.server.mta_sts),
+            tls_policy::MtaStsCache::new(
+                config.server.mta_sts,
+                Some(config.server.data_path.with_file_name("mta-sts")),
+            ),
             config.server.dane,
             reports.clone(),
+            email_auth.clone(),
         ))
     } else {
         None

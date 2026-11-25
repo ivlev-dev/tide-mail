@@ -181,6 +181,7 @@ pub fn sign_outbound(
     from: &str,
     recipients: &[String],
     raw: &[u8],
+    authenticator: Option<&Arc<MessageAuthenticator>>,
 ) -> Result<Vec<u8>, String> {
     let mut signed = if settings.is_enabled() {
         sign_dkim(settings, raw).unwrap_or_else(|error| {
@@ -191,13 +192,13 @@ pub fn sign_outbound(
         raw.to_vec()
     };
     if settings.arc {
-        match sign_arc(settings, hostname, &signed) {
+        match sign_arc(settings, hostname, &signed, authenticator) {
             Ok(value) => signed = value,
             Err(error) => eprintln!("arc sealing {from}: {error}"),
         }
     }
     if settings.dkim2 {
-        match sign_dkim2(settings, from, recipients, &signed) {
+        match sign_dkim2(settings, from, recipients, &signed, authenticator) {
             Ok(value) => signed = value,
             Err(error) => eprintln!("dkim2 signing {from}: {error}"),
         }
@@ -218,7 +219,12 @@ fn signing_key(settings: &DkimSettings) -> Result<RsaKey<Sha256>, String> {
     RsaKey::<Sha256>::from_key_der(key).map_err(|error| error.to_string())
 }
 
-fn sign_arc(settings: &DkimSettings, hostname: &str, raw: &[u8]) -> Result<Vec<u8>, String> {
+fn sign_arc(
+    settings: &DkimSettings,
+    hostname: &str,
+    raw: &[u8],
+    authenticator: Option<&Arc<MessageAuthenticator>>,
+) -> Result<Vec<u8>, String> {
     use mail_auth::arc::{ArcOutput, ArcSealer};
     use mail_auth::headers::HeaderWriter;
     let selector = if settings.arc_selector.is_empty() {
@@ -229,6 +235,20 @@ fn sign_arc(settings: &DkimSettings, hostname: &str, raw: &[u8]) -> Result<Vec<u
     let message =
         AuthenticatedMessage::parse(raw).ok_or_else(|| "message parse failed".to_string())?;
     let results = AuthenticationResults::new(hostname);
+    let arc_output = if has_header(raw, b"arc-seal:") {
+        let authenticator = authenticator
+            .ok_or_else(|| "ARC verifier is not configured for chain continuation".to_string())?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(authenticator.verify_arc(&message))
+    } else {
+        ArcOutput::default()
+    };
+    if !arc_output.can_be_sealed() {
+        return Err("incoming ARC chain cannot be sealed".into());
+    }
     let sealed = ArcSealer::from_key(signing_key(settings)?)
         .domain(&settings.domain)
         .selector(selector)
@@ -243,7 +263,7 @@ fn sign_arc(settings: &DkimSettings, hostname: &str, raw: &[u8]) -> Result<Vec<u
             "Content-Type",
             "DKIM-Signature",
         ])
-        .seal(&message, &results, &ArcOutput::default())
+        .seal(&message, &results, &arc_output)
         .map_err(|error| error.to_string())?;
     let mut out = sealed.to_header().into_bytes();
     out.extend_from_slice(raw);
@@ -255,8 +275,10 @@ fn sign_dkim2(
     from: &str,
     recipients: &[String],
     raw: &[u8],
+    authenticator: Option<&Arc<MessageAuthenticator>>,
 ) -> Result<Vec<u8>, String> {
-    use mail_auth::dkim2::{Dkim2Signer, Hop};
+    use mail_auth::dkim2::output::Dkim2Result;
+    use mail_auth::dkim2::{Dkim2Signer, Envelope, Hop};
     let selector = if settings.dkim2_selector.is_empty() {
         &settings.selector
     } else {
@@ -265,12 +287,38 @@ fn sign_dkim2(
     let signer = Dkim2Signer::from_key(mail_auth::crypto::DkimKey::from(signing_key(settings)?))
         .domain(&settings.domain)
         .selector(selector);
-    let signed = signer
-        .sign(raw, Hop::real(from, recipients), None)
-        .map_err(|error| error.to_string())?;
+    let signed = if has_header(raw, b"dkim2-signature:") {
+        let authenticator = authenticator
+            .ok_or_else(|| "DKIM2 verifier is not configured for chain continuation".to_string())?;
+        let message =
+            AuthenticatedMessage::parse(raw).ok_or_else(|| "message parse failed".to_string())?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let output =
+            runtime.block_on(authenticator.verify_dkim2(&message, Envelope::new(from, recipients)));
+        if !matches!(output.result(), Dkim2Result::Pass) {
+            return Err("incoming DKIM2 chain did not verify".into());
+        }
+        signer
+            .sign(raw, Hop::real(from, recipients), Some(&output))
+            .map_err(|error| error.to_string())?
+    } else {
+        signer
+            .sign(raw, Hop::real(from, recipients), None)
+            .map_err(|error| error.to_string())?
+    };
     let mut out = signed.to_header().into_bytes();
     out.extend_from_slice(raw);
     Ok(out)
+}
+
+fn has_header(raw: &[u8], name: &[u8]) -> bool {
+    raw.split(|byte| *byte == b'\n').any(|line| {
+        line.get(..name.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+    })
 }
 
 pub fn sign_dkim(settings: &DkimSettings, raw: &[u8]) -> Result<Vec<u8>, String> {
@@ -514,6 +562,30 @@ mod tests {
     }
 
     #[test]
+    fn detects_existing_arc_and_dkim2_headers() {
+        assert!(has_header(b"ARC-Seal: i=1\r\n", b"arc-seal:"));
+        assert!(has_header(b"DKIM2-Signature: i=1\r\n", b"dkim2-signature:"));
+        assert!(!has_header(b"X-Other: 1\r\n", b"arc-seal:"));
+    }
+
+    #[test]
+    fn refuses_chain_continuation_without_verifier() {
+        let raw = b"ARC-Seal: i=1; a=rsa-sha256; d=mail.local; s=arc; cv=none; b=x\r\nFrom: alice@mail.local\r\n\r\nHello\r\n";
+        assert!(sign_arc(&signing_settings(), "mail.local", raw, None).is_err());
+        let raw = b"DKIM2-Signature: i=1; m=1; d=mail.local; s=dkim2; b=x\r\nFrom: alice@mail.local\r\n\r\nHello\r\n";
+        assert!(
+            sign_dkim2(
+                &signing_settings(),
+                "alice@mail.local",
+                &["bob@example.com".to_string()],
+                raw,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn seals_message_with_arc() {
         let raw = b"From: alice@mail.local\r\nTo: bob@example.com\r\nSubject: ARC\r\nDate: Tue, 25 Nov 2025 12:00:00 +0000\r\nMessage-ID: <arc@mail.local>\r\n\r\nHello\r\n";
         let signed = sign_outbound(
@@ -522,6 +594,7 @@ mod tests {
             "alice@mail.local",
             &["bob@example.com".to_string()],
             raw,
+            None,
         )
         .unwrap();
         let text = String::from_utf8_lossy(&signed);
@@ -540,6 +613,7 @@ mod tests {
             "alice@mail.local",
             &["bob@example.com".to_string()],
             raw,
+            None,
         )
         .unwrap();
         let text = String::from_utf8_lossy(&signed);

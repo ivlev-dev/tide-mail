@@ -1,14 +1,16 @@
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::Arc;
 
 use monoio::net::{TcpListener, TcpStream};
+use rustls::{ClientConnection, StreamOwned};
 use tide_core::parse_message;
 use tide_smtp::{Action, SmtpConfig, SmtpSession};
 use uuid::Uuid;
 
 use crate::app::App;
+use crate::config::BurlSettings;
 use crate::net::{BufferedConn, Conn};
 
 pub async fn serve_smtp(
@@ -71,6 +73,7 @@ async fn handle_connection(
             ..SmtpConfig::default()
         }
     };
+    config.enable_burl_imap = app.config.burl.imap_enabled;
     config.enable_starttls = app.tls.is_some() && !implicit_tls;
     config.allow_insecure_auth = app.tls.is_none();
     let (mut session, greeting) = SmtpSession::new(config);
@@ -114,7 +117,9 @@ async fn handle_connection(
                 }
                 Action::FetchBurl { url, last } => {
                     let limit = 64 * 1024 * 1024;
-                    let result = monoio::spawn_blocking(move || fetch_burl(&url, limit)).await;
+                    let burl = app.config.burl.clone();
+                    let result =
+                        monoio::spawn_blocking(move || fetch_burl(&url, limit, &burl)).await;
                     match result {
                         Ok(Ok(chunk)) => {
                             actions.extend(session.feed_burl_chunk(&chunk, last));
@@ -189,7 +194,322 @@ fn add_trace_headers(
     out
 }
 
-fn fetch_burl(url: &str, limit: usize) -> Result<Vec<u8>, (u16, String)> {
+struct ImapTarget {
+    host: String,
+    port: u16,
+    mailbox: String,
+    uid: u32,
+}
+
+fn parse_imap_url(url: &str, burl: &BurlSettings) -> Result<ImapTarget, (u16, String)> {
+    if !burl.imap_enabled {
+        return Err((554, "5.7.8 IMAP BURL is disabled".to_string()));
+    }
+    if burl.imap_user.is_empty() {
+        return Err((
+            554,
+            "5.7.8 IMAP BURL credentials are not configured".to_string(),
+        ));
+    }
+    let parsed =
+        reqwest::Url::parse(url).map_err(|_| (554, "5.7.1 Invalid BURL URL".to_string()))?;
+    if parsed.scheme() != "imap" {
+        return Err((554, "5.7.1 BURL requires imap or https".to_string()));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| (554, "5.7.1 BURL has no host".to_string()))?
+        .to_ascii_lowercase();
+    if !burl
+        .imap_hosts
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&host))
+    {
+        return Err((554, "5.7.8 BURL IMAP host is not trusted".to_string()));
+    }
+    let decoded = percent_encoding::percent_decode_str(parsed.path())
+        .decode_utf8_lossy()
+        .to_string();
+    if decoded.to_ascii_lowercase().contains("urlauth=") {
+        return Err((554, "5.7.8 URLAUTH is not supported".to_string()));
+    }
+    let lower = decoded.to_ascii_lowercase();
+    let uid_pos = lower
+        .find("uid=")
+        .ok_or_else(|| (554, "5.6.6 IMAP URL has no UID".to_string()))?;
+    let uid = decoded[uid_pos + 4..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse::<u32>()
+        .map_err(|_| (554, "5.6.6 IMAP URL has an invalid UID".to_string()))?;
+    let mailbox = decoded[..uid_pos]
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .filter_map(|segment| segment.split(';').next())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    let mailbox = if mailbox.is_empty() {
+        "INBOX".to_string()
+    } else {
+        mailbox
+    };
+    if mailbox.contains(['\r', '\n']) || burl.imap_user.contains(['\r', '\n']) {
+        return Err((554, "5.7.1 Invalid IMAP command input".to_string()));
+    }
+    Ok(ImapTarget {
+        host,
+        port: parsed.port().unwrap_or(burl.imap_port),
+        mailbox,
+        uid,
+    })
+}
+
+enum ImapStream {
+    Tls(StreamOwned<ClientConnection, std::net::TcpStream>),
+}
+
+impl Read for ImapStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tls(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for ImapStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tls(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+struct ImapClient {
+    stream: ImapStream,
+    tag: u32,
+}
+
+impl ImapClient {
+    fn new(stream: ImapStream) -> Self {
+        Self { stream, tag: 0 }
+    }
+
+    fn read_greeting(&mut self) -> Result<(), String> {
+        let line = self.read_line()?;
+        let text = String::from_utf8_lossy(&line).to_ascii_uppercase();
+        if text.starts_with("* OK") {
+            Ok(())
+        } else {
+            Err(format!("IMAP greeting rejected: {text}"))
+        }
+    }
+
+    fn command(&mut self, command: &str) -> Result<Vec<u8>, String> {
+        self.tag += 1;
+        let tag = format!("a{}", self.tag);
+        write!(self.stream, "{tag} {command}\r\n").map_err(|error| error.to_string())?;
+        self.stream.flush().map_err(|error| error.to_string())?;
+        self.read_until_tag(&tag)
+    }
+
+    fn read_until_tag(&mut self, tag: &str) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        loop {
+            let line = self.read_line()?;
+            let text = String::from_utf8_lossy(&line).to_string();
+            out.extend_from_slice(&line);
+            if let Some(size) = imap_literal_size(&text) {
+                let mut body = vec![0u8; size];
+                self.stream
+                    .read_exact(&mut body)
+                    .map_err(|error| error.to_string())?;
+                out.extend_from_slice(&body);
+            }
+            if text.starts_with(tag) {
+                if text.to_ascii_uppercase().contains("OK") {
+                    return Ok(out);
+                }
+                return Err(text.trim().to_string());
+            }
+        }
+    }
+
+    fn read_line(&mut self) -> Result<Vec<u8>, String> {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            self.stream
+                .read_exact(&mut byte)
+                .map_err(|error| error.to_string())?;
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                return Ok(line);
+            }
+            if line.len() > 1024 * 1024 {
+                return Err("IMAP line is too long".to_string());
+            }
+        }
+    }
+}
+
+fn imap_literal_size(line: &str) -> Option<usize> {
+    let trimmed = line.trim_end();
+    if !trimmed.ends_with('}') {
+        return None;
+    }
+    let open = trimmed.rfind('{')?;
+    trimmed[open + 1..trimmed.len() - 1].parse().ok()
+}
+
+fn imap_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn extract_imap_body(response: &[u8]) -> Option<Vec<u8>> {
+    let marker = b"BODY[]";
+    let start = response
+        .windows(marker.len())
+        .position(|window| window == marker)?;
+    let rest = &response[start + marker.len()..];
+    let open = rest.iter().position(|byte| *byte == b'{')?;
+    let close = rest[open + 1..].iter().position(|byte| *byte == b'}')? + open + 1;
+    let size = std::str::from_utf8(&rest[open + 1..close])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    let body_start = rest[close + 1..]
+        .windows(2)
+        .position(|window| window == b"\r\n")?
+        + close
+        + 3;
+    response
+        .get(start + marker.len() + body_start..start + marker.len() + body_start + size)
+        .map(|body| body.to_vec())
+}
+
+fn fetch_imap(url: &str, limit: usize, burl: &BurlSettings) -> Result<Vec<u8>, (u16, String)> {
+    let target = parse_imap_url(url, burl)?;
+    let socket = std::net::TcpStream::connect((target.host.as_str(), target.port))
+        .map_err(|error| (451, format!("4.4.1 IMAP connect failed: {error}")))?;
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .map_err(|error| (451, error.to_string()))?;
+    socket
+        .set_write_timeout(Some(std::time::Duration::from_secs(30)))
+        .map_err(|error| (451, error.to_string()))?;
+    let stream = if burl.imap_starttls {
+        let mut plain = socket;
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            plain
+                .read_exact(&mut byte)
+                .map_err(|error| (451, error.to_string()))?;
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        if !String::from_utf8_lossy(&line)
+            .to_ascii_uppercase()
+            .starts_with("* OK")
+        {
+            return Err((451, "4.4.1 IMAP greeting rejected".to_string()));
+        }
+        plain
+            .write_all(b"a0 STARTTLS\r\n")
+            .map_err(|error| (451, error.to_string()))?;
+        plain.flush().map_err(|error| (451, error.to_string()))?;
+        let mut response = Vec::new();
+        loop {
+            response.clear();
+            let mut byte = [0u8; 1];
+            loop {
+                plain
+                    .read_exact(&mut byte)
+                    .map_err(|error| (451, error.to_string()))?;
+                response.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            if String::from_utf8_lossy(&response).starts_with("a0 ") {
+                break;
+            }
+        }
+        if !String::from_utf8_lossy(&response)
+            .to_ascii_uppercase()
+            .contains("OK")
+        {
+            return Err((451, "4.4.1 IMAP STARTTLS rejected".to_string()));
+        }
+        ImapStream::Tls(imap_tls(plain, &target.host)?)
+    } else {
+        ImapStream::Tls(imap_tls(socket, &target.host)?)
+    };
+    let mut client = ImapClient::new(stream);
+    if !burl.imap_starttls {
+        client.read_greeting().map_err(|error| (451, error))?;
+    }
+    imap_fetch_with_client(&mut client, &target, burl, limit)
+}
+
+fn imap_fetch_with_client(
+    client: &mut ImapClient,
+    target: &ImapTarget,
+    burl: &BurlSettings,
+    limit: usize,
+) -> Result<Vec<u8>, (u16, String)> {
+    client
+        .command(&format!(
+            "LOGIN {} {}",
+            imap_quote(&burl.imap_user),
+            imap_quote(&burl.imap_password)
+        ))
+        .map_err(|error| (554, format!("5.7.8 IMAP login failed: {error}")))?;
+    client
+        .command(&format!("SELECT {}", imap_quote(&target.mailbox)))
+        .map_err(|error| (554, format!("5.6.6 IMAP SELECT failed: {error}")))?;
+    let response = client
+        .command(&format!("UID FETCH {} (BODY.PEEK[])", target.uid))
+        .map_err(|error| (554, format!("5.6.6 IMAP FETCH failed: {error}")))?;
+    let body = extract_imap_body(&response)
+        .ok_or_else(|| (554, "5.6.6 IMAP URL returned no data".to_string()))?;
+    if body.len() > limit {
+        return Err((554, "5.3.4 BURL content is too large".to_string()));
+    }
+    let _ = client.command("LOGOUT");
+    Ok(body)
+}
+
+fn imap_tls(
+    stream: std::net::TcpStream,
+    host: &str,
+) -> Result<StreamOwned<ClientConnection, std::net::TcpStream>, (u16, String)> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| (451, "4.4.1 invalid IMAP host name".to_string()))?;
+    let connection =
+        ClientConnection::new(Arc::new(config), name).map_err(|error| (451, error.to_string()))?;
+    Ok(StreamOwned::new(connection, stream))
+}
+
+fn fetch_burl(url: &str, limit: usize, burl: &BurlSettings) -> Result<Vec<u8>, (u16, String)> {
+    if url.to_ascii_lowercase().starts_with("imap://") {
+        return fetch_imap(url, limit, burl);
+    }
     let parsed =
         reqwest::Url::parse(url).map_err(|_| (554, "5.7.1 Invalid BURL URL".to_string()))?;
     if parsed.scheme() != "https" {
@@ -564,8 +884,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_imap_burl() {
+        let burl = BurlSettings {
+            imap_enabled: true,
+            imap_hosts: vec!["imap.example.com".into()],
+            imap_user: "submit".into(),
+            imap_password: "secret".into(),
+            imap_port: 993,
+            imap_starttls: false,
+        };
+        let target = parse_imap_url(
+            "imap://user@imap.example.com/outbox;UIDVALIDITY=1/;UID=25",
+            &burl,
+        )
+        .unwrap();
+        assert_eq!(target.mailbox, "outbox");
+        assert_eq!(target.uid, 25);
+        assert_eq!(target.port, 993);
+        assert!(parse_imap_url("imap://user@evil.example.com/INBOX/;UID=1", &burl).is_err());
+        assert!(
+            parse_imap_url(
+                "imap://user@imap.example.com/INBOX/;UID=1;URLAUTH=submit+user",
+                &burl
+            )
+            .is_err()
+        );
+        assert_eq!(imap_quote("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn extracts_imap_literal() {
+        let response = b"* 1 FETCH (UID 25 BODY[] {5}\r\nhello)\r\na2 OK done\r\n";
+        assert_eq!(extract_imap_body(response).unwrap(), b"hello");
+    }
+
+    #[test]
     fn rejects_non_https_burl() {
-        assert!(fetch_burl("http://example.com/message", 1024).is_err());
-        assert!(fetch_burl("file:///etc/passwd", 1024).is_err());
+        let burl = BurlSettings::default();
+        assert!(fetch_burl("http://example.com/message", 1024, &burl).is_err());
+        assert!(fetch_burl("file:///etc/passwd", 1024, &burl).is_err());
     }
 }

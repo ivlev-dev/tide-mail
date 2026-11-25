@@ -2629,6 +2629,7 @@ dependencies = [
  "monoio",
  "monoio-rustls",
  "parking_lot",
+ "percent-encoding",
  "psl",
  "rand_core 0.6.4",
  "rcgen",

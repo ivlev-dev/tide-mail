@@ -1,36 +1,40 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hickory_resolver::Resolver;
 use hickory_resolver::proto::rr::RData;
 use hickory_resolver::proto::rr::RecordType;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MtaStsMode {
     Enforce,
     Testing,
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Policy {
     mode: MtaStsMode,
     mx: Vec<String>,
-    expires_at: Instant,
+    expires_at: i64,
 }
 
 pub struct MtaStsCache {
     enabled: bool,
     policies: RwLock<HashMap<String, Policy>>,
+    cache_dir: Option<PathBuf>,
 }
 
 impl MtaStsCache {
-    pub fn new(enabled: bool) -> Arc<Self> {
+    pub fn new(enabled: bool, cache_dir: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             enabled,
             policies: RwLock::new(HashMap::new()),
+            cache_dir,
         })
     }
 
@@ -59,9 +63,18 @@ impl MtaStsCache {
     }
 
     fn policy(&self, domain: &str) -> Result<Option<Policy>, String> {
+        let now = now_secs();
         if let Some(policy) = self.policies.read().get(domain) {
-            if policy.expires_at > Instant::now() {
+            if policy.expires_at > now {
                 return Ok(Some(policy.clone()));
+            }
+        }
+        if let Some(policy) = self.load_disk(domain) {
+            if policy.expires_at > now {
+                self.policies
+                    .write()
+                    .insert(domain.to_string(), policy.clone());
+                return Ok(Some(policy));
             }
         }
         let policy = fetch_policy(domain)?;
@@ -69,9 +82,54 @@ impl MtaStsCache {
             self.policies
                 .write()
                 .insert(domain.to_string(), policy.clone());
+            self.store_disk(domain, policy);
         }
         Ok(policy)
     }
+
+    fn cache_path(&self, domain: &str) -> Option<PathBuf> {
+        let dir = self.cache_dir.as_ref()?;
+        let name = domain
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        Some(dir.join(format!("{name}.json")))
+    }
+
+    fn load_disk(&self, domain: &str) -> Option<Policy> {
+        let path = self.cache_path(domain)?;
+        let raw = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    fn store_disk(&self, domain: &str, policy: &Policy) {
+        let Some(path) = self.cache_path(domain) else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let Ok(raw) = serde_json::to_vec(policy) else {
+            return;
+        };
+        let temp = path.with_extension("tmp");
+        if std::fs::write(&temp, raw).is_ok() {
+            let _ = std::fs::rename(temp, path);
+        }
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn matches_mx(patterns: &[String], host: &str) -> bool {
@@ -124,7 +182,7 @@ fn fetch_policy(domain: &str) -> Result<Option<Policy>, String> {
     Ok(Some(Policy {
         mode,
         mx,
-        expires_at: Instant::now() + Duration::from_secs(max_age.min(86_400)),
+        expires_at: now_secs() + max_age.min(2_592_000) as i64,
     }))
 }
 
@@ -190,9 +248,16 @@ pub fn dane_matches(records: &[DaneRecord], certificate: &[u8]) -> bool {
     dane_chain_matches(records, &[certificate])
 }
 
-pub fn dane_chain_matches(records: &[DaneRecord], certificates: &[&[u8]]) -> bool {
+#[derive(Debug, Default)]
+struct DaneMatch {
+    end_entity: bool,
+    authorities: Vec<Vec<u8>>,
+}
+
+fn dane_match(records: &[DaneRecord], certificates: &[&[u8]]) -> Option<DaneMatch> {
     use sha2::{Digest, Sha256, Sha512};
     use x509_parser::parse_x509_certificate;
+    let mut matched = DaneMatch::default();
     for record in records {
         if !matches!(record.usage, 2 | 3) {
             continue;
@@ -217,12 +282,26 @@ pub fn dane_chain_matches(records: &[DaneRecord], certificates: &[&[u8]]) -> boo
                 2 => Sha512::digest(material).as_slice() == record.data.as_slice(),
                 _ => false,
             };
-            if matches {
-                return true;
+            if !matches {
+                continue;
+            }
+            if record.usage == 3 {
+                matched.end_entity = true;
+            } else {
+                matched.authorities.push(certificate.to_vec());
             }
         }
     }
-    false
+    if matched.end_entity || !matched.authorities.is_empty() {
+        Some(matched)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+pub fn dane_chain_matches(records: &[DaneRecord], certificates: &[&[u8]]) -> bool {
+    dane_match(records, certificates).is_some()
 }
 
 #[allow(dead_code)]
@@ -255,11 +334,28 @@ impl rustls::client::danger::ServerCertVerifier for DaneVerifier {
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let mut chain = vec![end_entity.as_ref()];
         chain.extend(_intermediates.iter().map(|cert| cert.as_ref()));
-        if dane_chain_matches(&self.records, &chain) {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General("DANE TLSA mismatch".into()))
+        let Some(matched) = dane_match(&self.records, &chain) else {
+            return Err(rustls::Error::General("DANE TLSA mismatch".into()));
+        };
+        if matched.end_entity || matched.authorities.is_empty() {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
         }
+        let mut roots = rustls::RootCertStore::empty();
+        for authority in matched.authorities {
+            roots
+                .add(rustls::pki_types::CertificateDer::from(authority))
+                .map_err(|error| rustls::Error::General(error.to_string()))?;
+        }
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|error| rustls::Error::General(error.to_string()))?;
+        verifier.verify_server_cert(
+            end_entity,
+            _intermediates,
+            _server_name,
+            _ocsp_response,
+            _now,
+        )
     }
 
     fn verify_tls12_signature(
@@ -315,6 +411,22 @@ mod tests {
         assert!(matches_mx(&["mx.example.com".into()], "MX.EXAMPLE.COM"));
         assert!(matches_mx(&["*.example.com".into()], "mx.example.com"));
         assert!(!matches_mx(&["mx.example.com".into()], "evil.example.com"));
+    }
+
+    #[test]
+    fn persists_mta_sts_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = MtaStsCache::new(true, Some(dir.path().to_path_buf()));
+        let policy = Policy {
+            mode: MtaStsMode::Enforce,
+            mx: vec!["mx.example.com".into()],
+            expires_at: now_secs() + 60,
+        };
+        cache.store_disk("example.com", &policy);
+        let loaded = cache.load_disk("example.com").unwrap();
+        assert_eq!(loaded.mode, MtaStsMode::Enforce);
+        assert_eq!(loaded.mx, vec!["mx.example.com".to_string()]);
+        assert!(loaded.expires_at > now_secs());
     }
 
     #[test]

@@ -31,7 +31,7 @@
 - enhanced status codes
 - trace-заголовки `Received`, `Return-Path`, `Delivered-To`, loop limit
 - `LHLO` и per-recipient ответы в режиме LMTP
-- `BURL <https-url> [LAST]` на submission с защитой от SSRF
+- `BURL <url> [LAST]` на submission: `https://` с защитой от SSRF, `imap://` через доверенный IMAP-хост
 
 ## LMTP
 
@@ -48,6 +48,17 @@
 - `BY=<секунды>;R` задаёт дедлайн с failure DSN `5.4.7`; `BY=<секунды>;N` шлёт delayed DSN `4.4.7` и продолжает попытки.
 - `REQUIRETLS` требует TLS при outbound-доставке.
 - `BURL https://... LAST` заменяет `DATA`; сервер скачивает тело по HTTPS и применяет обычные проверки.
+- `BURL imap://host/mailbox/;UID=... LAST` скачивает тело из IMAP по STARTTLS или implicit TLS.
+
+```toml
+[burl]
+imap_enabled = true
+imap_hosts = ["imap.example.com"]
+imap_user = "submit"
+imap_password = "change-me"
+imap_port = 993
+imap_starttls = false
+```
 
 Ограничения: размер сообщения, число получателей, длина строки, таймауты соединения (на уровне транспорта).
 

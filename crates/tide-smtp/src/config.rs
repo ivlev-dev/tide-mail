@@ -42,6 +42,7 @@ pub struct SmtpConfig {
     pub max_future_release_secs: u64,
     pub enable_deliver_by: bool,
     pub enable_burl: bool,
+    pub enable_burl_imap: bool,
     pub max_hops: usize,
     pub auth_mechanisms: Vec<AuthMechanism>,
 }
@@ -68,6 +69,7 @@ impl Default for SmtpConfig {
             max_future_release_secs: 2_592_000,
             enable_deliver_by: true,
             enable_burl: false,
+            enable_burl_imap: false,
             max_hops: 50,
             auth_mechanisms: vec![AuthMechanism::Plain, AuthMechanism::Login],
         }
