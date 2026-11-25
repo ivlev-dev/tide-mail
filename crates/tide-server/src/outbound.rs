@@ -25,6 +25,12 @@ pub struct OutboundJob {
     pub message_id: String,
     #[serde(default)]
     pub dsn: bool,
+    #[serde(default)]
+    pub require_tls: bool,
+    #[serde(default)]
+    pub dsn_ret: Option<String>,
+    #[serde(default)]
+    pub envid: Option<String>,
 }
 
 #[derive(Clone)]
@@ -113,6 +119,9 @@ impl OutboundQueue {
             raw,
             message_id: String::new(),
             dsn: false,
+            require_tls: false,
+            dsn_ret: None,
+            envid: None,
         }
     }
 }
@@ -174,6 +183,9 @@ fn deliver_with_retry(
             raw: dsn,
             message_id: job.message_id.clone(),
             dsn: true,
+            require_tls: false,
+            dsn_ret: None,
+            envid: job.envid.clone(),
         };
         if let Some(dsn_job) = write_job(dir, dsn_job) {
             let _ = sender.send(dsn_job);
@@ -208,7 +220,7 @@ fn deliver_once(
         .map(|(_, domain)| domain)
         .ok_or_else(|| "recipient has no domain".to_string())?;
     let hosts = resolve_mx(domain)?;
-    let require_tls = policy.check(domain, &hosts, tls)?;
+    let require_tls = policy.check(domain, &hosts, tls)? || job.require_tls;
     let mut last_error = String::new();
     for host in hosts {
         match deliver_host(hostname, tls, dane, require_tls, &host, job, raw) {

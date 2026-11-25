@@ -56,8 +56,14 @@ pub fn build_failure_dsn(job: &OutboundJob, hostname: &str, reason: &str) -> Vec
              Action: failed\r\n\
              Status: 5.0.0\r\n\
              Diagnostic-Code: smtp; {reason}\r\n\
-             Original-Message-ID: {message_id}\r\n",
-            job.id, job.to
+             Original-Message-ID: {message_id}\r\n{}\
+             ",
+            job.id,
+            job.to,
+            job.envid
+                .as_ref()
+                .map(|envid| format!("Original-Envelope-Id: {envid}\r\n"))
+                .unwrap_or_default()
         )
         .as_bytes(),
     );
@@ -94,6 +100,9 @@ mod tests {
                 .to_vec(),
             message_id: "m1".into(),
             dsn: false,
+            require_tls: false,
+            dsn_ret: None,
+            envid: None,
         }
     }
 

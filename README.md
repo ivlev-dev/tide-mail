@@ -160,6 +160,7 @@ with smtplib.SMTP("127.0.0.1", 2525) as smtp:
 - [Antivirus scanning](docs/antivirus.md)
 - [Backup и HA](docs/backup-ha.md)
 - [Sharded index](docs/index-sharding.md)
+- [RFC coverage](docs/rfc.md)
 - [Аудит безопасности](docs/security.md)
 - [Аудит производительности](docs/performance.md)
 

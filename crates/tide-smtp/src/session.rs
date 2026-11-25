@@ -6,12 +6,23 @@ use crate::config::{AuthMechanism, SmtpConfig};
 use crate::reply::Reply;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recipient {
+    pub address: String,
+    pub notify: Option<String>,
+    pub orcpt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
     pub from: String,
     pub to: Vec<String>,
+    pub recipients: Vec<Recipient>,
     pub size: Option<u64>,
     pub smtputf8: bool,
     pub body_8bitmime: bool,
+    pub dsn_ret: Option<String>,
+    pub envid: Option<String>,
+    pub require_tls: bool,
 }
 
 impl Envelope {
@@ -19,9 +30,13 @@ impl Envelope {
         Self {
             from,
             to: Vec::new(),
+            recipients: Vec::new(),
             size: None,
             smtputf8: false,
             body_8bitmime: false,
+            dsn_ret: None,
+            envid: None,
+            require_tls: false,
         }
     }
 }
@@ -38,6 +53,10 @@ pub enum Action {
         mechanism: String,
         username: String,
         secret: String,
+    },
+    ReadBdat {
+        size: usize,
+        last: bool,
     },
     Deliver {
         envelope: Envelope,
@@ -65,6 +84,7 @@ pub struct SmtpSession {
     data: Vec<u8>,
     data_too_large: bool,
     auth_username: Option<String>,
+    bdat_active: bool,
 }
 
 impl SmtpSession {
@@ -80,6 +100,7 @@ impl SmtpSession {
             data: Vec::new(),
             data_too_large: false,
             auth_username: None,
+            bdat_active: false,
         };
         (session, greeting)
     }
@@ -105,6 +126,18 @@ impl SmtpSession {
     }
 
     pub fn feed_line(&mut self, line: &[u8]) -> Vec<Action> {
+        if matches!(
+            self.state,
+            State::AuthPlain | State::AuthLoginUser | State::AuthLoginPass
+        ) && line == b"*"
+        {
+            self.state = State::Command;
+            self.auth_username = None;
+            return vec![Action::Reply(Reply::new(
+                501,
+                "5.7.0 Authentication canceled",
+            ))];
+        }
         if line.len() > self.config.max_line_size && self.state != State::Data {
             return vec![Action::Reply(Reply::new(500, "Line too long"))];
         }
@@ -114,6 +147,24 @@ impl SmtpSession {
             State::AuthLoginUser => self.feed_auth_login_user(line),
             State::AuthLoginPass => self.feed_auth_login_pass(line),
             State::Command => self.feed_command(line),
+        }
+    }
+
+    pub fn feed_bdat_chunk(&mut self, chunk: &[u8], last: bool) -> Vec<Action> {
+        if self.data.len() + chunk.len() > self.config.max_message_size {
+            self.data.clear();
+            self.bdat_active = false;
+            return vec![Action::Reply(Reply::new(
+                552,
+                "5.3.4 Message size exceeds fixed maximum",
+            ))];
+        }
+        self.data.extend_from_slice(chunk);
+        if last {
+            self.bdat_active = false;
+            self.finish_data()
+        } else {
+            vec![Action::Reply(Reply::new(250, "2.0.0 Chunk received"))]
         }
     }
 
@@ -201,6 +252,29 @@ impl SmtpSession {
                         "5.5.4 SMTPUTF8 is not supported",
                     ))];
                 }
+                if !smtputf8 && !mail.from.is_ascii() {
+                    return vec![Action::Reply(Reply::new(
+                        553,
+                        "5.6.7 SMTPUTF8 is required for this address",
+                    ))];
+                }
+                let dsn_ret = mail.param("RET").map(str::to_ascii_uppercase);
+                if let Some(ret) = &dsn_ret {
+                    if !self.config.enable_dsn || !matches!(ret.as_str(), "HDRS" | "FULL") {
+                        return vec![Action::Reply(Reply::new(
+                            501,
+                            "5.5.4 Invalid RET parameter",
+                        ))];
+                    }
+                }
+                let envid = mail.param("ENVID").map(str::to_string);
+                let require_tls = mail.has_param("REQUIRETLS");
+                if require_tls && !self.config.enable_require_tls {
+                    return vec![Action::Reply(Reply::new(
+                        504,
+                        "5.5.4 REQUIRETLS is not supported",
+                    ))];
+                }
                 let body_8bitmime = mail
                     .param("BODY")
                     .map(|value| value.eq_ignore_ascii_case("8BITMIME"))
@@ -215,7 +289,12 @@ impl SmtpSession {
                 envelope.size = size;
                 envelope.smtputf8 = smtputf8;
                 envelope.body_8bitmime = body_8bitmime;
+                envelope.dsn_ret = dsn_ret;
+                envelope.envid = envid;
+                envelope.require_tls = require_tls;
                 self.envelope = Some(envelope);
+                self.bdat_active = false;
+                self.data.clear();
                 vec![Action::Reply(Reply::new(250, "2.1.0 Sender accepted"))]
             }
             Command::Rcpt(rcpt) => {
@@ -229,11 +308,64 @@ impl SmtpSession {
                     ))];
                 }
                 let envelope = self.envelope.as_mut().expect("checked above");
+                if !envelope.smtputf8 && !rcpt.to.is_ascii() {
+                    return vec![Action::Reply(Reply::new(
+                        553,
+                        "5.6.7 SMTPUTF8 is required for this address",
+                    ))];
+                }
                 if envelope.to.len() >= self.config.max_recipients {
                     return vec![Action::Reply(Reply::new(452, "4.5.3 Too many recipients"))];
                 }
-                envelope.to.push(rcpt.to);
+                let notify = rcpt.param("NOTIFY").map(str::to_ascii_uppercase);
+                if let Some(notify) = &notify {
+                    if !self.config.enable_dsn
+                        || !notify
+                            .split(',')
+                            .all(|value| matches!(value, "SUCCESS" | "FAILURE" | "DELAY" | "NEVER"))
+                    {
+                        return vec![Action::Reply(Reply::new(
+                            501,
+                            "5.5.4 Invalid NOTIFY parameter",
+                        ))];
+                    }
+                }
+                let orcpt = rcpt.param("ORCPT").map(str::to_string);
+                envelope.to.push(rcpt.to.clone());
+                envelope.recipients.push(Recipient {
+                    address: rcpt.to,
+                    notify,
+                    orcpt,
+                });
                 vec![Action::Reply(Reply::new(250, "2.1.5 Recipient accepted"))]
+            }
+            Command::Bdat { size, last } => {
+                if !self.config.enable_chunking {
+                    return vec![Action::Reply(Reply::new(
+                        502,
+                        "5.5.1 CHUNKING is not supported",
+                    ))];
+                }
+                let Some(envelope) = &self.envelope else {
+                    return vec![Action::Reply(Reply::new(503, "5.5.1 Send MAIL first"))];
+                };
+                if envelope.to.is_empty() {
+                    return vec![Action::Reply(Reply::new(503, "5.5.1 Send RCPT first"))];
+                }
+                if size > self.config.max_message_size as u64 {
+                    return vec![Action::Reply(Reply::new(
+                        552,
+                        "5.3.4 Message size exceeds fixed maximum",
+                    ))];
+                }
+                if !self.bdat_active {
+                    self.data.clear();
+                    self.bdat_active = true;
+                }
+                vec![Action::ReadBdat {
+                    size: size as usize,
+                    last,
+                }]
             }
             Command::Data => {
                 let Some(envelope) = &self.envelope else {
@@ -245,6 +377,7 @@ impl SmtpSession {
                 self.state = State::Data;
                 self.data.clear();
                 self.data_too_large = false;
+                self.bdat_active = false;
                 vec![Action::Reply(Reply::new(
                     354,
                     "End data with <CR><LF>.<CR><LF>",
@@ -253,6 +386,8 @@ impl SmtpSession {
             Command::Rset => {
                 self.envelope = None;
                 self.state = State::Command;
+                self.bdat_active = false;
+                self.data.clear();
                 vec![Action::Reply(Reply::new(250, "2.0.0 Reset"))]
             }
             Command::Noop => vec![Action::Reply(Reply::new(250, "2.0.0 OK"))],
@@ -309,6 +444,15 @@ impl SmtpSession {
         }
         if self.config.enable_pipelining {
             lines.push("PIPELINING".into());
+        }
+        if self.config.enable_chunking {
+            lines.push("CHUNKING".into());
+        }
+        if self.config.enable_dsn {
+            lines.push("DSN".into());
+        }
+        if self.config.enable_require_tls {
+            lines.push("REQUIRETLS".into());
         }
         if self.config.enable_starttls && !self.tls_active {
             lines.push("STARTTLS".into());
@@ -452,26 +596,30 @@ impl SmtpSession {
         }]
     }
 
+    fn finish_data(&mut self) -> Vec<Action> {
+        let Some(envelope) = self.envelope.take() else {
+            return vec![Action::Reply(Reply::new(
+                503,
+                "5.5.1 No active transaction",
+            ))];
+        };
+        if self.data_too_large || self.data.len() > self.config.max_message_size {
+            self.data.clear();
+            self.data_too_large = false;
+            return vec![Action::Reply(Reply::new(
+                552,
+                "5.3.4 Message size exceeds fixed maximum",
+            ))];
+        }
+        let data = std::mem::take(&mut self.data);
+        self.data_too_large = false;
+        vec![Action::Deliver { envelope, data }]
+    }
+
     fn feed_data_line(&mut self, line: &[u8]) -> Vec<Action> {
         if line == b"." {
             self.state = State::Command;
-            let Some(envelope) = self.envelope.take() else {
-                return vec![Action::Reply(Reply::new(
-                    503,
-                    "5.5.1 No active transaction",
-                ))];
-            };
-            if self.data_too_large || self.data.len() > self.config.max_message_size {
-                self.data.clear();
-                self.data_too_large = false;
-                return vec![Action::Reply(Reply::new(
-                    552,
-                    "5.3.4 Message size exceeds fixed maximum",
-                ))];
-            }
-            let data = std::mem::take(&mut self.data);
-            self.data_too_large = false;
-            return vec![Action::Deliver { envelope, data }];
+            return self.finish_data();
         }
         if self.data_too_large {
             return Vec::new();
@@ -580,6 +728,86 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn advertises_rfc_extensions() {
+        let mut session = session();
+        let actions = session.feed_line(b"EHLO client");
+        let reply = &replies(&actions)[0];
+        for capability in ["CHUNKING", "DSN", "REQUIRETLS", "SMTPUTF8"] {
+            assert!(
+                reply.lines.iter().any(|line| line == capability),
+                "{capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_bdat_chunks() {
+        let mut session = session();
+        session.feed_line(b"EHLO client");
+        session.feed_line(b"MAIL FROM:<a@example.com>");
+        session.feed_line(b"RCPT TO:<b@example.com>");
+        let actions = session.feed_line(b"BDAT 5 LAST");
+        assert_eq!(
+            actions[0],
+            Action::ReadBdat {
+                size: 5,
+                last: true
+            }
+        );
+        let actions = session.feed_bdat_chunk(b"hello", true);
+        match &actions[0] {
+            Action::Deliver { data, .. } => assert_eq!(data, b"hello"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_dsn_parameters() {
+        let mut session = session();
+        session.feed_line(b"EHLO client");
+        assert_eq!(
+            replies(&session.feed_line(b"MAIL FROM:<a@example.com> RET=FULL ENVID=abc REQUIRETLS"))
+                [0]
+            .code,
+            250
+        );
+        assert_eq!(
+            replies(
+                &session.feed_line(
+                    b"RCPT TO:<b@example.com> NOTIFY=FAILURE ORCPT=rfc822;b@example.com"
+                )
+            )[0]
+            .code,
+            250
+        );
+        let envelope = session.envelope.as_ref().unwrap();
+        assert_eq!(envelope.dsn_ret.as_deref(), Some("FULL"));
+        assert_eq!(envelope.envid.as_deref(), Some("abc"));
+        assert!(envelope.require_tls);
+        assert_eq!(envelope.recipients[0].notify.as_deref(), Some("FAILURE"));
+    }
+
+    #[test]
+    fn requires_smtputf8_for_unicode_address() {
+        let mut session = session();
+        session.feed_line(b"EHLO client");
+        let actions = session.feed_line("MAIL FROM:<юзер@example.com>".as_bytes());
+        assert_eq!(replies(&actions)[0].code, 553);
+        let actions = session.feed_line("MAIL FROM:<юзер@example.com> SMTPUTF8".as_bytes());
+        assert_eq!(replies(&actions)[0].code, 250);
+    }
+
+    #[test]
+    fn auth_can_be_canceled() {
+        let mut session = session();
+        session.feed_line(b"EHLO client");
+        let actions = session.feed_line(b"AUTH LOGIN");
+        assert!(matches!(actions[0], Action::AuthChallenge { .. }));
+        let actions = session.feed_line(b"*");
+        assert_eq!(replies(&actions)[0].code, 501);
     }
 
     #[test]

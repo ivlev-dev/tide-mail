@@ -25,6 +25,15 @@ pub struct RcptCommand {
     pub params: Vec<(String, Option<String>)>,
 }
 
+impl RcptCommand {
+    pub fn param(&self, key: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .and_then(|(_, value)| value.as_deref())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Ehlo(String),
@@ -32,6 +41,10 @@ pub enum Command {
     Mail(MailCommand),
     Rcpt(RcptCommand),
     Data,
+    Bdat {
+        size: u64,
+        last: bool,
+    },
     Rset,
     Noop,
     Quit,
@@ -53,6 +66,7 @@ impl Command {
             Self::Mail(_) => "MAIL",
             Self::Rcpt(_) => "RCPT",
             Self::Data => "DATA",
+            Self::Bdat { .. } => "BDAT",
             Self::Rset => "RSET",
             Self::Noop => "NOOP",
             Self::Quit => "QUIT",
@@ -104,6 +118,19 @@ pub fn parse_command(line: &[u8]) -> Result<Command, String> {
             Ok(Command::Rcpt(RcptCommand { to, params }))
         }
         "DATA" => Ok(Command::Data),
+        "BDAT" => {
+            let mut parts = rest.split_whitespace();
+            let size = parts
+                .next()
+                .ok_or_else(|| "BDAT требует размер".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "некорректный BDAT size".to_string())?;
+            let last = parts
+                .next()
+                .map(|value| value.eq_ignore_ascii_case("LAST"))
+                .unwrap_or(false);
+            Ok(Command::Bdat { size, last })
+        }
         "RSET" => Ok(Command::Rset),
         "NOOP" => Ok(Command::Noop),
         "QUIT" => Ok(Command::Quit),
@@ -209,6 +236,17 @@ mod tests {
             Command::Auth {
                 mechanism: "PLAIN".into(),
                 initial: Some("AHRlc3QAcGFzcw==".into())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_bdat() {
+        assert_eq!(
+            parse_command(b"BDAT 1024 LAST").unwrap(),
+            Command::Bdat {
+                size: 1024,
+                last: true
             }
         );
     }

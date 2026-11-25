@@ -19,10 +19,14 @@
 - `EHLO` / `HELO`
 - `MAIL FROM`, `RCPT TO`, `DATA`, `RSET`, `NOOP`, `QUIT`
 - `SIZE`, `8BITMIME`, `SMTPUTF8`, `PIPELINING`
+- `CHUNKING` / `BDAT`
+- `DSN`: `RET`, `ENVID`, `NOTIFY`, `ORCPT`
+- `REQUIRETLS`
 - `STARTTLS`
-- `AUTH PLAIN`, `AUTH LOGIN`
+- `AUTH PLAIN`, `AUTH LOGIN`, cancel через `*`
 - `VRFY`, `HELP`
 - enhanced status codes
+- trace-заголовки `Received`, `Return-Path`, `Delivered-To`, loop limit
 
 Ограничения: размер сообщения, число получателей, длина строки, таймауты соединения (на уровне транспорта).
 

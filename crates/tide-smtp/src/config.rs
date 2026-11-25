@@ -33,6 +33,10 @@ pub struct SmtpConfig {
     pub enable_smtputf8: bool,
     pub enable_8bitmime: bool,
     pub enable_pipelining: bool,
+    pub enable_chunking: bool,
+    pub enable_dsn: bool,
+    pub enable_require_tls: bool,
+    pub max_hops: usize,
     pub auth_mechanisms: Vec<AuthMechanism>,
 }
 
@@ -49,6 +53,10 @@ impl Default for SmtpConfig {
             enable_smtputf8: true,
             enable_8bitmime: true,
             enable_pipelining: true,
+            enable_chunking: true,
+            enable_dsn: true,
+            enable_require_tls: true,
+            max_hops: 50,
             auth_mechanisms: vec![AuthMechanism::Plain, AuthMechanism::Login],
         }
     }

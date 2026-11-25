@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -77,8 +78,8 @@ async fn handle_connection(
         let Some(line) = conn.read_line(64 * 1024).await? else {
             return Ok(());
         };
-        let actions = session.feed_line(&line);
-        for action in actions {
+        let mut actions = VecDeque::from(session.feed_line(&line));
+        while let Some(action) = actions.pop_front() {
             match action {
                 Action::Reply(reply) => {
                     conn.write_all(&reply.to_wire()).await?;
@@ -106,6 +107,10 @@ async fn handle_connection(
                     };
                     conn.write_all(&reply.to_wire()).await?;
                 }
+                Action::ReadBdat { size, last } => {
+                    let chunk = conn.read_exact(size, 64 * 1024 * 1024).await?;
+                    actions.extend(session.feed_bdat_chunk(&chunk, last));
+                }
                 Action::Deliver { envelope, data } => {
                     let helo = session.helo().unwrap_or("unknown").to_string();
                     let reply = deliver(&app, submission, peer, helo, envelope, data).await;
@@ -115,6 +120,42 @@ async fn handle_connection(
             }
         }
     }
+}
+
+fn received_hops(raw: &[u8]) -> usize {
+    raw.split(|byte| *byte == b'\n')
+        .filter(|line| {
+            line.get(..9)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Received:"))
+        })
+        .count()
+}
+
+fn add_trace_headers(
+    raw: &[u8],
+    hostname: &str,
+    helo: &str,
+    peer: IpAddr,
+    from: &str,
+    recipient: &str,
+    id: &str,
+) -> Vec<u8> {
+    let date = mail_parser::DateTime::from_timestamp(crate::auth::now_millis() / 1000).to_rfc822();
+    let clean = |value: &str| value.replace(['\r', '\n'], " ");
+    let header = format!(
+        "Received: from {} ([{}]) by {} with ESMTP id {} for <{}>; {}\r\n         Return-Path: <{}>\r\n         Delivered-To: {}\r\n",
+        clean(helo),
+        peer,
+        clean(hostname),
+        clean(id),
+        clean(recipient),
+        date,
+        clean(from),
+        clean(recipient)
+    );
+    let mut out = header.into_bytes();
+    out.extend_from_slice(raw);
+    out
 }
 
 async fn deliver(
@@ -217,6 +258,9 @@ async fn deliver(
             }
         }
     }
+    if received_hops(&data) >= 50 {
+        return tide_smtp::Reply::new(554, "5.4.6 Too many hops");
+    }
     let mut local = Vec::new();
     let mut remote = Vec::new();
     for recipient in &envelope.to {
@@ -237,11 +281,15 @@ async fn deliver(
             );
         };
         for recipient in &remote {
-            if !outbound.enqueue(crate::outbound::OutboundQueue::job(
+            let mut job = crate::outbound::OutboundQueue::job(
                 envelope.from.clone(),
                 recipient.clone(),
                 data.clone(),
-            )) {
+            );
+            job.require_tls = envelope.require_tls;
+            job.dsn_ret = envelope.dsn_ret.clone();
+            job.envid = envelope.envid.clone();
+            if !outbound.enqueue(job) {
                 return tide_smtp::Reply::new(451, "4.3.0 Outbound queue is unavailable");
             }
         }
@@ -265,7 +313,16 @@ async fn deliver(
             "INBOX"
         };
         let id = Uuid::new_v4().to_string();
-        let message = match parse_message(&data, recipient.clone(), mailbox, id.clone()) {
+        let traced = add_trace_headers(
+            &data,
+            &app.config.server.hostname,
+            &helo,
+            peer,
+            &envelope.from,
+            &recipient,
+            &id,
+        );
+        let message = match parse_message(&traced, recipient.clone(), mailbox, id.clone()) {
             Ok(message) => message,
             Err(error) => {
                 eprintln!("smtp parse: {error}");

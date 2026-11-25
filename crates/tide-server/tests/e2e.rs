@@ -269,7 +269,11 @@ fn smtp_http_and_sync_end_to_end() {
     );
     assert_eq!(status, 200);
     let message = GetMessageResponse::decode(&body).unwrap();
-    assert!(String::from_utf8_lossy(&message.body.raw).contains("Hello E2E body"));
+    let raw = String::from_utf8_lossy(&message.body.raw);
+    assert!(raw.contains("Hello E2E body"));
+    assert!(raw.contains("Received: from"));
+    assert!(raw.contains("Return-Path: <bob@example.com>"));
+    assert!(raw.contains("Delivered-To: alice@mail.local"));
 
     let spam_raw = b"From: spam@example.com\r\nTo: alice@mail.local\r\nSubject: WINNER\r\nDate: Tue, 25 Nov 2025 12:10:00 +0000\r\nMessage-ID: <spam@example.com>\r\n\r\nclick here to claim your prize\r\n";
     smtp = SmtpClient::connect(server.smtp.as_str()).unwrap();
