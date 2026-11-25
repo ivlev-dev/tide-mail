@@ -1,0 +1,31 @@
+[package]
+name = "tide-store"
+description = "Mmap single-file mail storage with lane-sharded durable writes and full-text search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+byteorder.workspace = true
+crc32c.workspace = true
+crossbeam-channel.workspace = true
+futures.workspace = true
+futures-channel.workspace = true
+io-uring.workspace = true
+libc.workspace = true
+memmap2.workspace = true
+parking_lot.workspace = true
+rust-stemmers.workspace = true
+silent-protocol.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tide-core = { path = "../tide-core" }
+unicode-segmentation.workspace = true
+uuid.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

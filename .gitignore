@@ -1,0 +1,6 @@
+/target
+*.tide
+*.tide.next
+*.tide.compact
+.env
+.DS_Store

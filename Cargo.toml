@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["ivlev-dev"]
+repository = "https://github.com/ivlev-dev/tide-mail"
+rust-version = "1.85"
+
+[workspace.dependencies]
+byteorder = "1"
+crc32c = "0.6"
+crossbeam-channel = "0.5"
+futures = "0.3"
+futures-channel = "0.3"
+io-uring = "0.7"
+libc = "0.2"
+memmap2 = "0.9"
+parking_lot = "0.12"
+proptest = "1"
+roaring = "0.10"
+rust-stemmers = "1.2"
+silent-protocol = "0.14"
+tempfile = "3"
+thiserror = "2"
+unicode-segmentation = "1.12"
+uuid = { version = "1", features = ["v4"] }
+zstd = "0.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
