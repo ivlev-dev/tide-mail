@@ -81,8 +81,9 @@ docker compose up --build
 
 ## SMTP
 
-- Порты 25/587 (в примере 2525/5870), STARTTLS, AUTH PLAIN/LOGIN.
+- Порты 25/465/587 (в примере 2525/4650/5870), implicit TLS, STARTTLS, AUTH PLAIN/LOGIN.
 - ESMTP: SIZE, 8BITMIME, SMTPUTF8, PIPELINING.
+- Входящие SPF/DKIM/DMARC, исходящие DKIM + opportunistic TLS + MX.
 - Входящие письма маршрутизируются локальным аккаунтам, парсятся и индексируются.
 - Submission с внешними получателями ставит письма в outbound-очередь (если `outbound_enabled`).
 
