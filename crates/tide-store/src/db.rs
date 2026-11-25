@@ -912,7 +912,7 @@ impl Db {
         let inner = self.state();
         let index = &*inner.index;
         let mut stats = AccountStats::default();
-        for doc in index.docs_for_account(account_id).iter() {
+        index.for_each_doc_for_account(account_id, |doc| {
             stats.total += 1;
             if doc.flags & tide_core::flags::SEEN == 0 {
                 stats.unread += 1;
@@ -922,7 +922,7 @@ impl Db {
             if doc.flags & tide_core::flags::SEEN == 0 {
                 mailbox.unread += 1;
             }
-        }
+        });
         stats
     }
 
@@ -1291,6 +1291,29 @@ fn apply_job(context: &ApplyContext, job: &ApplyJob) -> Result<(), StoreError> {
     let mut changes = context.changes.write();
     let mut folders = context.folders.write();
     let mut blob_refs = context.blob_refs.write();
+    if job.records.iter().all(|record| record.kind == KIND_MESSAGE) {
+        let mut messages = Vec::with_capacity(job.records.len());
+        for (record_index, record) in job.records.iter().enumerate() {
+            let message = job
+                .decoded_messages
+                .get(record_index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| StoreError::corrupt("message was not decoded"))?;
+            push_change(&mut changes, ChangeEntry::from_message(job.seq, message));
+            catalog.insert(
+                record.key.clone(),
+                Location {
+                    lane_id: job.lane_id,
+                    batch_offset: job.batch_offset,
+                    batch_len: job.batch_len,
+                    record_index,
+                },
+            );
+            messages.push(message);
+        }
+        index.insert_many(&messages);
+        return Ok(());
+    }
     for (record_index, record) in job.records.iter().enumerate() {
         match record.kind {
             KIND_MESSAGE => {

@@ -125,6 +125,7 @@ FolderRecord { account_id, name, role, deleted, created_at, updated_at }
 - Поиск выполняется по RAM, без чтения диска.
 - Индекс account-sharded: 16 шардов; внутри postings ещё 16 шардов по терму.
 - Вложения с `data=[]` ссылаются на content-addressed blob-store через `blobref:`-записи.
+- GC blob: `POST /v1/admin/gc-blobs` с grace-периодом.
 
 Векторная секция зарезервирована, эмбеддинги в текущей итерации не подключены.
 
