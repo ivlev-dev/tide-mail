@@ -1,10 +1,11 @@
+use silent_protocol::SilentProto;
 use std::sync::Arc;
 
 use monoio::net::{TcpListener, TcpStream};
 use parking_lot::RwLock;
 use tide_proto::{
-    BlobChunk, Cursor, Frame, SyncChanges, SyncOperation, SyncPushResult, SyncReject,
-    frame::frame_length, op_kind,
+    BlobChunk, Cursor, Frame, PutMessagePayload, SyncChanges, SyncOperation, SyncPushResult,
+    SyncReject, frame::frame_length, op_kind,
 };
 use tide_store::Db;
 use tide_sync::{ServerSession, SyncBackend, SyncError, backend::SyncAuth as AuthProvider};
@@ -85,6 +86,44 @@ impl SyncBackend for StoreSyncBackend {
         let mut applied = 0u32;
         let mut rejected = Vec::new();
         for operation in operations {
+            if operation.kind == op_kind::PUT_MESSAGE {
+                let result = PutMessagePayload::decode(&operation.payload)
+                    .map_err(|error| SyncError::Backend(error.to_string()))
+                    .and_then(|payload| {
+                        if payload.account_id != account_id {
+                            return Err(SyncError::Unauthorized("account mismatch".into()));
+                        }
+                        let message_id = if payload.message_id.is_empty() {
+                            uuid::Uuid::new_v4().to_string()
+                        } else {
+                            payload.message_id
+                        };
+                        let mut message = tide_core::parse_message(
+                            &payload.raw,
+                            account_id,
+                            &payload.mailbox,
+                            message_id,
+                        )
+                        .map_err(|error| SyncError::Backend(error.to_string()))?;
+                        message.flags = payload.flags;
+                        futures::executor::block_on(self.db.append_message(message))
+                            .map(|_| ())
+                            .map_err(|error| SyncError::Backend(error.to_string()))
+                    });
+                match result {
+                    Ok(()) => applied += 1,
+                    Err(error) => rejected.push(SyncReject {
+                        message_id: operation.message_id,
+                        code: if matches!(error, SyncError::Unauthorized(_)) {
+                            403
+                        } else {
+                            400
+                        },
+                        message: error.to_string(),
+                    }),
+                }
+                continue;
+            }
             if operation.kind != op_kind::PUT_MESSAGE {
                 match self.db.get_message(&operation.message_id) {
                     Ok(Some(message)) if message.account_id == account_id => {}

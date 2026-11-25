@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use tide_core::{Address, Message};
 
 use crate::index::Doc;
@@ -9,7 +10,7 @@ pub mod kind {
     pub const MOVE: u32 = 4;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeEntry {
     pub seq: u64,
     pub kind: u32,

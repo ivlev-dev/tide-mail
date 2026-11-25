@@ -2,15 +2,16 @@ pub mod mime;
 
 pub use mime::{MimeError, parse_message};
 
+use serde::{Deserialize, Serialize};
 use silent_protocol::SilentProto;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, SilentProto)]
 pub struct Address {
     pub email: String,
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, SilentProto)]
 pub struct Attachment {
     pub content_type: String,
     pub data: Vec<u8>,
@@ -18,7 +19,7 @@ pub struct Attachment {
     pub size: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, SilentProto)]
 pub struct Message {
     pub account_id: String,
     pub attachments: Vec<Attachment>,

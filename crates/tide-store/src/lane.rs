@@ -18,6 +18,12 @@ pub enum Durability {
     DataSync,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneInfo {
+    pub head: u64,
+    pub seq: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
     pub lane_id: u16,
@@ -34,6 +40,14 @@ enum LaneCommand {
         reply: oneshot::Sender<Result<Receipt, StoreError>>,
     },
     Checkpoint {
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
+    Info {
+        reply: oneshot::Sender<LaneInfo>,
+    },
+    SetCheckpoint {
+        head: u64,
+        seq: u64,
         reply: oneshot::Sender<Result<(), StoreError>>,
     },
     Shutdown,
@@ -103,8 +117,35 @@ impl LaneWriter {
     pub fn checkpoint_blocking(&self) -> Result<(), StoreError> {
         futures::executor::block_on(self.checkpoint())
     }
+
+    pub async fn info(&self) -> Result<LaneInfo, StoreError> {
+        let (reply, receiver) = oneshot::channel();
+        self.handle
+            .tx
+            .send(LaneCommand::Info { reply })
+            .map_err(|_| StoreError::LaneClosed {
+                lane: self.handle.lane_id,
+            })?;
+        receiver.await.map_err(|_| StoreError::LaneClosed {
+            lane: self.handle.lane_id,
+        })
+    }
+
+    pub async fn set_checkpoint(&self, head: u64, seq: u64) -> Result<(), StoreError> {
+        let (reply, receiver) = oneshot::channel();
+        self.handle
+            .tx
+            .send(LaneCommand::SetCheckpoint { head, seq, reply })
+            .map_err(|_| StoreError::LaneClosed {
+                lane: self.handle.lane_id,
+            })?;
+        receiver.await.map_err(|_| StoreError::LaneClosed {
+            lane: self.handle.lane_id,
+        })?
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_lane(
     lane_id: u16,
     file: Arc<File>,
@@ -112,6 +153,8 @@ pub(crate) fn spawn_lane(
     capacity: u64,
     head: u64,
     seq: u64,
+    checkpoint_head: u64,
+    checkpoint_seq: u64,
     durability: Durability,
 ) -> Result<LaneWriter, StoreError> {
     let (tx, rx) = unbounded();
@@ -121,7 +164,17 @@ pub(crate) fn spawn_lane(
         .name(thread_name)
         .spawn(move || {
             run_lane(
-                lane_id, file, base, capacity, head, seq, durability, rx, init_tx,
+                lane_id,
+                file,
+                base,
+                capacity,
+                head,
+                seq,
+                checkpoint_head,
+                checkpoint_seq,
+                durability,
+                rx,
+                init_tx,
             )
         })
         .map_err(StoreError::Io)?;
@@ -154,6 +207,8 @@ struct LaneState {
     capacity: u64,
     head: u64,
     seq: u64,
+    checkpoint_head: u64,
+    checkpoint_seq: u64,
     durability: Durability,
     ring: IoUring,
 }
@@ -166,6 +221,8 @@ fn run_lane(
     capacity: u64,
     head: u64,
     seq: u64,
+    checkpoint_head: u64,
+    checkpoint_seq: u64,
     durability: Durability,
     rx: Receiver<LaneCommand>,
     init_tx: mpsc::Sender<Result<(), StoreError>>,
@@ -187,6 +244,8 @@ fn run_lane(
         capacity,
         head,
         seq,
+        checkpoint_head,
+        checkpoint_seq,
         durability,
         ring,
     };
@@ -202,6 +261,18 @@ fn run_lane(
                 let _ = reply.send(result);
             }
             LaneCommand::Checkpoint { reply } => {
+                let result = persist_lane_header(&file, &state);
+                let _ = reply.send(result);
+            }
+            LaneCommand::Info { reply } => {
+                let _ = reply.send(LaneInfo {
+                    head: state.head,
+                    seq: state.seq,
+                });
+            }
+            LaneCommand::SetCheckpoint { head, seq, reply } => {
+                state.checkpoint_head = head;
+                state.checkpoint_seq = seq;
                 let result = persist_lane_header(&file, &state);
                 let _ = reply.send(result);
             }
@@ -254,8 +325,8 @@ fn persist_lane_header(file: &File, state: &LaneState) -> Result<(), StoreError>
         capacity: state.capacity,
         head: state.head,
         seq: state.seq,
-        checkpoint_seq: state.seq,
-        checkpoint_head: state.head,
+        checkpoint_seq: state.checkpoint_seq,
+        checkpoint_head: state.checkpoint_head,
     };
     write_all_at(
         &mut IoUring::new(2).map_err(StoreError::Io)?,
@@ -382,6 +453,8 @@ mod tests {
             LANE_HEADER_SIZE + 1024 * 1024,
             LANE_HEADER_SIZE,
             1,
+            LANE_HEADER_SIZE,
+            0,
             Durability::DataSync,
         )
         .unwrap();

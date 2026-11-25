@@ -81,7 +81,7 @@ Cursor { lane: u32, seq: u64 }
 | `FLAGS` | абсолютная установка флагов |
 | `DELETE` | удаление |
 | `MOVE` | смена папки |
-| `PUT_MESSAGE` | пока не поддержано сервером |
+| `PUT_MESSAGE` | вставка нового письма (`PutMessagePayload`: account, mailbox, raw, flags, message_id) |
 
 `txn_id` идемпотентен: повторный push с тем же `txn_id` возвращает сохранённый результат. Ответ `PUSH_OK` содержит `applied`, `rejected`, `cursor`.
 
@@ -120,4 +120,4 @@ match client.handle(read_frame(&mut stream))? {
 
 - Нет сжатия кадров (capability зарезервирована).
 - Нет постоянной server-side очереди push между рестартами клиента: клиент повторяет с `txn_id`.
-- `PUT_MESSAGE` через sync пока отклоняется; новые письма создаются через SMTP/REST send.
+- `PUT_MESSAGE` требует `account_id`, совпадающий с аккаунтом сессии.

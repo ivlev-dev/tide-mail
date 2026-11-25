@@ -10,5 +10,6 @@ rust-version.workspace = true
 
 [dependencies]
 mail-parser.workspace = true
+serde.workspace = true
 silent-protocol.workspace = true
 thiserror.workspace = true

@@ -8,7 +8,7 @@
 |---|---|---|---|
 | 25 / `smtp_addr` | MX, приём почты | нет | да, если TLS настроен |
 | 587 / `submission_addr` | submission | да | да |
-| 465 | implicit TLS | пока не выделен отдельным listener | — |
+| 465 / `smtps_addr` | implicit TLS | нет | не нужен |
 
 Порты задаются в `tide.toml`; в примере используются непривилегированные 2525/5870.
 
@@ -48,16 +48,25 @@
 
 Для неизвестного домена на порту 25 возвращается `550 Relay access denied`.
 
+## Входящая аутентификация
+
+При `email_auth.enabled = true` сервер проверяет SPF, DKIM и DMARC через `mail-auth` и добавляет заголовок `Authentication-Results` перед сохранением. Проверка выполняется в blocking-пуле, чтобы не блокировать io_uring runtime.
+
+- `reject_spf_fail` — отклонять `Fail`/`SoftFail` SPF.
+- `reject_dmarc_fail` — отклонять при `DMARC Fail` и политике `reject`.
+
 ## Отправка
 
-Submission принимает внешних получателей, если `outbound_enabled = true`. Задание ставится в очередь `tide-outbound`:
+Submission принимает внешних получателей, если `outbound_enabled = true`. Задание пишется в персистентную очередь `outbound/<id>.bin` и передаётся worker'у:
 
-- домен получателя резолвится через системный resolver (A/AAAA, без MX);
+- MX-резолв через `hickory-resolver`, сортировка по preference;
+- fallback на A/AAAA домена, если MX нет;
 - подключение к порту 25;
-- `EHLO`, `MAIL FROM`, `RCPT TO`, `DATA`;
-- три попытки с backoff.
+- opportunistic STARTTLS, если сервер объявил его и `outbound_tls = true`;
+- DKIM-подпись, если настроен `[dkim]`;
+- три попытки с backoff; неудачное задание остаётся в очереди.
 
-Текущие ограничения outbound: нет MX-резолва, opportunistic TLS, DKIM-подписи и постоянной очереди на диске.
+Ограничения: нет MTA-STS/DANE, нет DSN/bounce-обработки.
 
 ## Проверка вручную
 

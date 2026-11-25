@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use rust_stemmers::{Algorithm, Stemmer};
+use serde::{Deserialize, Serialize};
 use tide_core::Message;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -91,7 +92,7 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Doc {
     pub id: String,
     pub account_id: String,
@@ -167,20 +168,20 @@ impl From<&Message> for Doc {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Posting {
     doc: u32,
     tf: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Slot {
     doc: Doc,
     deleted: bool,
     length: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchIndex {
     slots: Vec<Slot>,
     by_id: HashMap<String, u32>,

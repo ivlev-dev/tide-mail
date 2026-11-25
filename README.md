@@ -1,6 +1,6 @@
 # Tide Mail
 
-All-in-one почтовый сервер на Rust: SMTP с TLS/STARTTLS, собственное mmap-хранилище, полнотекстовый поиск, бинарный REST API на `silent-protocol` и sync-протокол вместо IMAP/JMAP.
+All-in-one почтовый сервер на Rust: SMTP с TLS/STARTTLS/implicit TLS, собственное mmap-хранилище, полнотекстовый поиск, бинарный REST API на `silent-protocol` и sync-протокол вместо IMAP/JMAP.
 
 Репозиторий: <https://github.com/ivlev-dev/tide-mail>
 
@@ -42,14 +42,28 @@ data_lanes = 8
 lane_capacity_mb = 512
 workers = 2
 http_addr = "127.0.0.1:8080"
+http_tls = false
 smtp_addr = "127.0.0.1:2525"
+smtps_addr = "127.0.0.1:4650"
 submission_addr = "127.0.0.1:5870"
 sync_addr = "127.0.0.1:9093"
 token_ttl_hours = 168
 outbound_enabled = false
+outbound_tls = true
+admin_token = "change-admin-token"
 
 [tls]
 self_signed = true
+
+[email_auth]
+enabled = true
+reject_spf_fail = false
+reject_dmarc_fail = false
+
+[dkim]
+# domain = "mail.local"
+# selector = "default"
+# private_key_path = "./certs/dkim.key"
 
 [[accounts]]
 email = "alice@mail.local"
@@ -142,16 +156,23 @@ E2E-тест (`crates/tide-server/tests/e2e.rs`) поднимает сервер
 
 1. SMTP-доставку;
 2. бинарный REST login/search/get/list/flags;
-3. sync handshake, pull и push.
+3. sync handshake, pull, push flags и `PUT_MESSAGE`;
+4. snapshot и online-компакцию через admin API.
 
-## Ограничения текущей версии
+## Дополнительно
 
-- Векторный семантический поиск и эмбеддинги отложены; секция в формате зарезервирована.
-- Нет online-компакции и снапшотов индекса: индекс пересобирается при старте.
-- Outbound: нет MX-резолва, DKIM-подписи, opportunistic TLS ипостоянной очереди.
-- Нет SPF/DKIM/DMARC-проверки входящих.
-- HTTP API без TLS/CORS; для production ставить за reverse proxy.
-- `PUT_MESSAGE` через sync пока не поддержан.
+- Снапшоты индекса: пишутся в index lane, загружаются при старте, replay идёт с checkpoint.
+- Online-компакция: `POST /v1/admin/compact` (нужен `admin_token`).
+- Outbound: MX-резолв, DKIM, opportunistic STARTTLS, персистентная очередь.
+- Входящие SPF/DKIM/DMARC через `mail-auth` + `Authentication-Results`.
+- HTTP TLS (`http_tls`) и CORS.
+- `PUT_MESSAGE` через sync.
+
+## Roadmap
+
+- Векторный семантический поиск и эмбеддинги (секция в формате зарезервирована).
+- MTA-STS/DANE, DSN/bounce-обработка.
+- ACL на уровне папок и JMAP-совместимый шлюз.
 
 ## Лицензия
 

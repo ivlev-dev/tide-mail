@@ -44,6 +44,10 @@ impl<S: Read + Write> SmtpClient<S> {
         &mut self.stream
     }
 
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
     pub fn read_reply(&mut self) -> Result<Reply, SmtpError> {
         let mut lines = Vec::new();
         let mut expected_code = None;

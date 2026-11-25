@@ -4,3 +4,6 @@
 *.tide.compact
 .env
 .DS_Store
+/data
+/outbound
+*.compact

@@ -43,8 +43,12 @@ Authorization: Bearer <token>
 | POST | `/v1/messages/delete` | `DeleteRequest` | `AckResponse` |
 | POST | `/v1/messages/move` | `MoveRequest` | `AckResponse` |
 | POST | `/v1/send` | `SendRequest` | `SendResponse` |
+| POST | `/v1/admin/snapshot` | — | `AckResponse` |
+| POST | `/v1/admin/compact` | — | `AckResponse` |
 
 `account_id` во всех запросах должен совпадать с аккаунтом токена.
+
+Админ-эндпоинты требуют заголовок `X-Admin-Token`, равный `server.admin_token`. Если токен не задан, админ-API отключён.
 
 ## Поиск
 
@@ -101,6 +105,7 @@ let body = login.encode()?;
 - `tide_proto::MessageBody` — text/html, вложения, raw.
 - Вложения в API адресуются индексом (`AttachmentMeta.id`), blob можно забрать через sync `BLOB_REQUEST`.
 
-## CORS
+## CORS и TLS
 
-CORS пока не включён: API рассчитан на same-origin web-клиент или reverse proxy. Заголовки `OPTIONS` не обрабатываются.
+- CORS включён: `Access-Control-Allow-Origin: *`, `OPTIONS` возвращает 204.
+- `http_tls = true` включает HTTPS на `http_addr` с тем же сертификатом, что SMTP/sync.

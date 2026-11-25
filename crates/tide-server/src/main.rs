@@ -2,6 +2,7 @@ mod app;
 mod auth;
 mod config;
 mod convert;
+mod email_auth;
 mod http;
 mod net;
 mod outbound;
@@ -64,14 +65,38 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let email_auth = if config.email_auth.enabled {
+        match mail_auth::MessageAuthenticator::new_system_conf() {
+            Ok(authenticator) => Some(std::sync::Arc::new(authenticator)),
+            Err(error) => {
+                eprintln!("email auth init: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let dkim = if config.dkim.is_enabled() {
+        Some(config.dkim.clone())
+    } else {
+        None
+    };
     let outbound = if config.server.outbound_enabled {
+        let outbound_dir = config
+            .server
+            .outbound_dir
+            .clone()
+            .unwrap_or_else(|| config.server.data_path.with_file_name("outbound"));
         Some(outbound::OutboundQueue::start(
+            outbound_dir,
             config.server.hostname.clone(),
+            dkim.clone(),
+            config.server.outbound_tls,
         ))
     } else {
         None
     };
-    let app = App::new(config.clone(), db, registry, tls, outbound);
+    let app = App::new(config.clone(), db, registry, tls, outbound, email_auth);
 
     println!(
         "Tide Mail: {} ({} воркеров)",
@@ -82,6 +107,9 @@ fn main() {
     }
     if let Some(address) = &config.server.smtp_addr {
         println!("  SMTP  {address}");
+    }
+    if let Some(address) = &config.server.smtps_addr {
+        println!("  SMTPS {address}");
     }
     if let Some(address) = &config.server.submission_addr {
         println!("  SUB   {address}");
@@ -97,7 +125,7 @@ fn main() {
         threads.push(
             std::thread::Builder::new()
                 .name(name)
-                .spawn(move || run_worker(app))
+                .spawn(move || run_worker(app, index))
                 .expect("worker thread"),
         );
     }
@@ -106,7 +134,7 @@ fn main() {
     }
 }
 
-fn run_worker(app: Arc<App>) {
+fn run_worker(app: Arc<App>, worker_index: usize) {
     let mut runtime = RuntimeBuilder::<monoio::IoUringDriver>::new()
         .enable_all()
         .attach_thread_pool(Box::new(DefaultThreadPool::new(4)))
@@ -119,7 +147,8 @@ fn run_worker(app: Arc<App>) {
             match TcpListener::bind_with_config(&address, &options) {
                 Ok(listener) => {
                     let app = Arc::clone(&app);
-                    monoio::spawn(http::serve_http(app, listener));
+                    let use_tls = app.config.server.http_tls && app.tls.is_some();
+                    monoio::spawn(http::serve_http(app, listener, use_tls));
                 }
                 Err(error) => eprintln!("http bind {address}: {error}"),
             }
@@ -128,7 +157,7 @@ fn run_worker(app: Arc<App>) {
             match TcpListener::bind_with_config(address, &options) {
                 Ok(listener) => {
                     let app = Arc::clone(&app);
-                    monoio::spawn(smtp::serve_smtp(app, listener, false));
+                    monoio::spawn(smtp::serve_smtp(app, listener, false, false));
                 }
                 Err(error) => eprintln!("smtp bind {address}: {error}"),
             }
@@ -137,9 +166,19 @@ fn run_worker(app: Arc<App>) {
             match TcpListener::bind_with_config(address, &options) {
                 Ok(listener) => {
                     let app = Arc::clone(&app);
-                    monoio::spawn(smtp::serve_smtp(app, listener, true));
+                    monoio::spawn(smtp::serve_smtp(app, listener, true, false));
                 }
                 Err(error) => eprintln!("submission bind {address}: {error}"),
+            }
+        }
+        if let Some(address) = &app.config.server.smtps_addr {
+            let address = address.clone();
+            match TcpListener::bind_with_config(&address, &options) {
+                Ok(listener) => {
+                    let app = Arc::clone(&app);
+                    monoio::spawn(smtp::serve_smtp(app, listener, false, true));
+                }
+                Err(error) => eprintln!("smtps bind {address}: {error}"),
             }
         }
         if let Some(address) = &app.config.server.sync_addr {
@@ -151,6 +190,18 @@ fn run_worker(app: Arc<App>) {
                 }
                 Err(error) => eprintln!("sync bind {address}: {error}"),
             }
+        }
+        if worker_index == 0 && app.config.server.snapshot_interval_secs > 0 {
+            let db = app.db.clone();
+            let interval = app.config.server.snapshot_interval_secs;
+            monoio::spawn(async move {
+                loop {
+                    monoio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    if let Err(error) = db.snapshot().await {
+                        eprintln!("snapshot: {error}");
+                    }
+                }
+            });
         }
         std::future::pending::<()>().await;
         #[allow(unreachable_code)]

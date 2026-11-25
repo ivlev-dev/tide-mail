@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use monoio::net::{TcpListener, TcpStream};
@@ -8,13 +9,20 @@ use uuid::Uuid;
 use crate::app::App;
 use crate::net::{BufferedConn, Conn};
 
-pub async fn serve_smtp(app: Arc<App>, listener: TcpListener, submission: bool) {
+pub async fn serve_smtp(
+    app: Arc<App>,
+    listener: TcpListener,
+    submission: bool,
+    implicit_tls: bool,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let app = Arc::clone(&app);
                 monoio::spawn(async move {
-                    if let Err(error) = handle_connection(app, stream, submission).await {
+                    if let Err(error) =
+                        handle_connection(app, stream, submission, implicit_tls, peer.ip()).await
+                    {
                         eprintln!("smtp {peer}: {error}");
                     }
                 });
@@ -31,8 +39,23 @@ async fn handle_connection(
     app: Arc<App>,
     stream: TcpStream,
     submission: bool,
+    implicit_tls: bool,
+    peer: IpAddr,
 ) -> std::io::Result<()> {
-    let mut conn = BufferedConn::new(Conn::plain(stream));
+    let conn = if implicit_tls {
+        let Some(acceptor) = app.tls.as_ref() else {
+            return Ok(());
+        };
+        Conn::Tls(Box::new(
+            acceptor
+                .accept(stream)
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+        ))
+    } else {
+        Conn::plain(stream)
+    };
+    let mut conn = BufferedConn::new(conn);
     let mut config = if submission {
         SmtpConfig::submission(app.config.server.hostname.clone())
     } else {
@@ -42,9 +65,12 @@ async fn handle_connection(
             ..SmtpConfig::default()
         }
     };
-    config.enable_starttls = app.tls.is_some();
+    config.enable_starttls = app.tls.is_some() && !implicit_tls;
     config.allow_insecure_auth = app.tls.is_none();
     let (mut session, greeting) = SmtpSession::new(config);
+    if implicit_tls {
+        session.tls_established();
+    }
     conn.write_all(&greeting.to_wire()).await?;
 
     loop {
@@ -81,7 +107,8 @@ async fn handle_connection(
                     conn.write_all(&reply.to_wire()).await?;
                 }
                 Action::Deliver { envelope, data } => {
-                    let reply = deliver(&app, submission, envelope, data).await;
+                    let helo = session.helo().unwrap_or("unknown").to_string();
+                    let reply = deliver(&app, submission, peer, helo, envelope, data).await;
                     conn.write_all(&reply.to_wire()).await?;
                 }
                 Action::Close => return Ok(()),
@@ -93,9 +120,36 @@ async fn handle_connection(
 async fn deliver(
     app: &App,
     submission: bool,
+    peer: IpAddr,
+    helo: String,
     envelope: tide_smtp::Envelope,
-    data: Vec<u8>,
+    mut data: Vec<u8>,
 ) -> tide_smtp::Reply {
+    if !submission && app.config.email_auth.enabled {
+        if let Some(authenticator) = app.email_auth.clone() {
+            let hostname = app.config.server.hostname.clone();
+            let mail_from = envelope.from.clone();
+            let raw = data.clone();
+            let handle = monoio::spawn_blocking(move || {
+                crate::email_auth::verify(authenticator, hostname, peer, helo, mail_from, raw)
+            });
+            match handle.await {
+                Ok(Ok(verification)) => {
+                    if app.config.email_auth.reject_spf_fail && verification.spf_fail {
+                        return tide_smtp::Reply::new(550, "5.7.23 SPF policy rejection");
+                    }
+                    if app.config.email_auth.reject_dmarc_fail && verification.dmarc_fail {
+                        return tide_smtp::Reply::new(550, "5.7.1 DMARC policy rejection");
+                    }
+                    let mut augmented = verification.header.into_bytes();
+                    augmented.extend_from_slice(&data);
+                    data = augmented;
+                }
+                Ok(Err(error)) => eprintln!("email auth: {error}"),
+                Err(_) => eprintln!("email auth: verification task cancelled"),
+            }
+        }
+    }
     let mut local = Vec::new();
     let mut remote = Vec::new();
     for recipient in &envelope.to {
@@ -116,11 +170,11 @@ async fn deliver(
             );
         };
         for recipient in &remote {
-            if !outbound.enqueue(crate::outbound::OutboundJob {
-                from: envelope.from.clone(),
-                to: recipient.clone(),
-                raw: data.clone(),
-            }) {
+            if !outbound.enqueue(crate::outbound::OutboundQueue::job(
+                envelope.from.clone(),
+                recipient.clone(),
+                data.clone(),
+            )) {
                 return tide_smtp::Reply::new(451, "4.3.0 Outbound queue is unavailable");
             }
         }

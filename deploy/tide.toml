@@ -5,16 +5,31 @@ data_lanes = 8
 lane_capacity_mb = 512
 workers = 2
 http_addr = "0.0.0.0:8080"
+http_tls = false
 smtp_addr = "0.0.0.0:2525"
+smtps_addr = "0.0.0.0:465"
 submission_addr = "0.0.0.0:5870"
 sync_addr = "0.0.0.0:9093"
 token_ttl_hours = 168
 outbound_enabled = false
+outbound_tls = true
+snapshot_interval_secs = 300
+# admin_token = "change-me"
 
 [tls]
 self_signed = true
 # cert_path = "/etc/tide/fullchain.pem"
 # key_path = "/etc/tide/privkey.pem"
+
+[email_auth]
+enabled = true
+reject_spf_fail = false
+reject_dmarc_fail = false
+
+[dkim]
+# domain = "mail.local"
+# selector = "default"
+# private_key_path = "/etc/tide/dkim.key"
 
 [[accounts]]
 email = "alice@mail.local"

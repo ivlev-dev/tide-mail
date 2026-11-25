@@ -91,6 +91,15 @@ pub mod op_kind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
+pub struct PutMessagePayload {
+    pub account_id: String,
+    pub flags: u64,
+    pub mailbox: String,
+    pub message_id: String,
+    pub raw: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, SilentProto)]
 pub struct SyncPush {
     pub account_id: String,
     pub txn_id: String,

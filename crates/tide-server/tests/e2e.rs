@@ -6,7 +6,8 @@ use std::time::Duration;
 use silent_protocol::SilentProto;
 use tide_proto::{
     AuthRequest, AuthResponse, Cursor, FlagsRequest, GetMessageRequest, GetMessageResponse,
-    ListRequest, ListResponse, SearchRequest, SearchResponse, SyncOperation, flags_mode, op_kind,
+    ListRequest, ListResponse, PutMessagePayload, SearchRequest, SearchResponse, SyncOperation,
+    flags_mode, op_kind,
 };
 use tide_smtp::SmtpClient;
 use tide_sync::{ClientEvent, ClientSession};
@@ -53,6 +54,7 @@ submission_addr = ""
 sync_addr = "127.0.0.1:{sync_port}"
 token_ttl_hours = 24
 outbound_enabled = false
+admin_token = "admin"
 
 [tls]
 self_signed = false
@@ -106,6 +108,28 @@ fn http_request(
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).unwrap();
     stream.write_all(body).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let headers = String::from_utf8_lossy(&response[..split]);
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    (status, response[split + 4..].to_vec())
+}
+
+fn admin_request(address: &str, path: &str) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(address).unwrap();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nX-Admin-Token: admin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).unwrap();
     let split = response
@@ -298,4 +322,63 @@ fn smtp_http_and_sync_end_to_end() {
     assert_eq!(status, 200);
     let message = GetMessageResponse::decode(&body).unwrap();
     assert_ne!(message.meta.flags & tide_core::flags::FLAGGED, 0);
+
+    let raw = b"From: push@example.com\r\nTo: alice@mail.local\r\nSubject: Sync pushed\r\nDate: Tue, 25 Nov 2025 13:00:00 +0000\r\nMessage-ID: <push@example.com>\r\n\r\nPushed via sync\r\n";
+    let payload = PutMessagePayload {
+        account_id: "alice@mail.local".into(),
+        flags: 0,
+        mailbox: "INBOX".into(),
+        message_id: String::new(),
+        raw: raw.to_vec(),
+    };
+    let push = client
+        .push_frame(
+            "alice@mail.local",
+            "e2e-put",
+            vec![SyncOperation {
+                kind: op_kind::PUT_MESSAGE,
+                message_id: String::new(),
+                flags: 0,
+                mailbox: "INBOX".into(),
+                payload: payload.encode().unwrap(),
+            }],
+        )
+        .unwrap();
+    write_frame(&mut stream, push);
+    match client.handle(read_frame(&mut stream)).unwrap() {
+        ClientEvent::Push(result) => {
+            assert_eq!(result.applied, 1);
+            assert!(result.rejected.is_empty());
+        }
+        other => panic!("unexpected put event: {other:?}"),
+    }
+    let search = SearchRequest {
+        account_id: "alice@mail.local".into(),
+        query: "pushed".into(),
+        limit: 10,
+        ..SearchRequest::default()
+    };
+    let (status, body) = http_request(
+        &server.http,
+        "POST",
+        "/v1/search",
+        Some(&token),
+        &search.encode().unwrap(),
+    );
+    assert_eq!(status, 200);
+    let results = SearchResponse::decode(&body).unwrap();
+    assert_eq!(results.hits.len(), 1);
+    assert_eq!(results.hits[0].message.subject, "Sync pushed");
+
+    assert_eq!(admin_request(&server.http, "/v1/admin/snapshot").0, 200);
+    assert_eq!(admin_request(&server.http, "/v1/admin/compact").0, 200);
+    let (status, body) = http_request(
+        &server.http,
+        "POST",
+        "/v1/search",
+        Some(&token),
+        &search.encode().unwrap(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(SearchResponse::decode(&body).unwrap().hits.len(), 1);
 }

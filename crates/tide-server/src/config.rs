@@ -10,6 +10,10 @@ pub struct Config {
     pub tls: TlsSettings,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+    #[serde(default)]
+    pub email_auth: EmailAuthSettings,
+    #[serde(default)]
+    pub dkim: DkimSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,11 +24,31 @@ pub struct ServerSettings {
     pub lane_capacity_mb: u64,
     pub workers: usize,
     pub http_addr: String,
+    #[serde(default)]
+    pub http_tls: bool,
     pub smtp_addr: Option<String>,
+    #[serde(default)]
+    pub smtps_addr: Option<String>,
     pub submission_addr: Option<String>,
     pub sync_addr: Option<String>,
     pub token_ttl_hours: u64,
     pub outbound_enabled: bool,
+    #[serde(default = "default_true")]
+    pub outbound_tls: bool,
+    #[serde(default)]
+    pub outbound_dir: Option<PathBuf>,
+    #[serde(default = "default_snapshot_interval")]
+    pub snapshot_interval_secs: u64,
+    #[serde(default)]
+    pub admin_token: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_snapshot_interval() -> u64 {
+    300
 }
 
 impl Default for ServerSettings {
@@ -38,12 +62,44 @@ impl Default for ServerSettings {
                 .map(|value| value.get().min(8))
                 .unwrap_or(2),
             http_addr: "127.0.0.1:8080".into(),
+            http_tls: false,
             smtp_addr: Some("127.0.0.1:2525".into()),
+            smtps_addr: None,
             submission_addr: Some("127.0.0.1:5870".into()),
             sync_addr: Some("127.0.0.1:9093".into()),
             token_ttl_hours: 24 * 7,
             outbound_enabled: false,
+            outbound_tls: true,
+            outbound_dir: None,
+            snapshot_interval_secs: 300,
+            admin_token: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmailAuthSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub reject_spf_fail: bool,
+    #[serde(default)]
+    pub reject_dmarc_fail: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DkimSettings {
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub selector: String,
+    #[serde(default)]
+    pub private_key_path: Option<PathBuf>,
+}
+
+impl DkimSettings {
+    pub fn is_enabled(&self) -> bool {
+        !self.domain.is_empty() && !self.selector.is_empty() && self.private_key_path.is_some()
     }
 }
 
@@ -99,6 +155,17 @@ impl Config {
         if self.server.workers == 0 {
             return Err(ConfigError::Invalid("workers must be >= 1".into()));
         }
+        if self.dkim.is_enabled()
+            && self
+                .dkim
+                .private_key_path
+                .as_ref()
+                .is_some_and(|path| !path.exists())
+        {
+            return Err(ConfigError::Invalid(
+                "DKIM private key does not exist".into(),
+            ));
+        }
         for account in &self.accounts {
             if !account.email.contains('@') || account.password.is_empty() {
                 return Err(ConfigError::Invalid(format!(
@@ -131,17 +198,33 @@ data_lanes = 8
 lane_capacity_mb = 512
 workers = 2
 http_addr = "127.0.0.1:8080"
+http_tls = false
 smtp_addr = "127.0.0.1:2525"
+# smtps_addr = "127.0.0.1:4650"
 submission_addr = "127.0.0.1:5870"
 sync_addr = "127.0.0.1:9093"
 token_ttl_hours = 168
 outbound_enabled = false
+outbound_tls = true
+# outbound_dir = "./data/outbound"
+snapshot_interval_secs = 300
+# admin_token = "change-me"
 
 [tls]
 # Оставьте пустым для самоподписанного сертификата.
 self_signed = true
 # cert_path = "./certs/fullchain.pem"
 # key_path = "./certs/privkey.pem"
+
+[email_auth]
+enabled = false
+reject_spf_fail = false
+reject_dmarc_fail = false
+
+[dkim]
+# domain = "mail.local"
+# selector = "default"
+# private_key_path = "./certs/dkim.key"
 
 [[accounts]]
 email = "alice@mail.local"

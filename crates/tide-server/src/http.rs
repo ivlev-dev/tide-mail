@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use monoio::net::{TcpListener, TcpStream};
+use monoio::net::TcpListener;
 use silent_protocol::SilentProto;
 use tide_core::parse_message;
 use tide_proto::{
@@ -22,13 +22,27 @@ use crate::net::{BufferedConn, Conn};
 const MAX_BODY: usize = 64 * 1024 * 1024;
 const MAX_HEADERS: usize = 64 * 1024;
 
-pub async fn serve_http(app: Arc<App>, listener: TcpListener) {
+pub async fn serve_http(app: Arc<App>, listener: TcpListener, use_tls: bool) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let app = Arc::clone(&app);
                 monoio::spawn(async move {
-                    if let Err(error) = handle_connection(app, stream).await {
+                    let conn = if use_tls {
+                        match app.tls.as_ref() {
+                            Some(acceptor) => match acceptor.accept(stream).await {
+                                Ok(stream) => Conn::Tls(Box::new(stream)),
+                                Err(error) => {
+                                    eprintln!("http tls {peer}: {error}");
+                                    return;
+                                }
+                            },
+                            None => return,
+                        }
+                    } else {
+                        Conn::plain(stream)
+                    };
+                    if let Err(error) = handle_connection(app, conn).await {
                         eprintln!("http {peer}: {error}");
                     }
                 });
@@ -48,8 +62,8 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-async fn handle_connection(app: Arc<App>, stream: TcpStream) -> std::io::Result<()> {
-    let mut conn = BufferedConn::new(Conn::plain(stream));
+async fn handle_connection(app: Arc<App>, conn: Conn) -> std::io::Result<()> {
+    let mut conn = BufferedConn::new(conn);
     let Some(request) = read_request(&mut conn).await? else {
         return Ok(());
     };
@@ -135,6 +149,14 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: 403,
+            code: 403,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<StoreError> for ApiError {
@@ -180,6 +202,48 @@ async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Res
         return send_proto(conn, 200, response)
             .await
             .map_err(|error| ApiError::internal(error.to_string()));
+    }
+
+    if request.path.starts_with("/v1/admin/") {
+        let Some(expected) = app.config.server.admin_token.as_deref() else {
+            return Err(ApiError::forbidden("admin API is disabled"));
+        };
+        let provided = request
+            .headers
+            .get("x-admin-token")
+            .map(String::as_str)
+            .unwrap_or("");
+        if provided != expected {
+            return Err(ApiError::forbidden("invalid admin token"));
+        }
+        return match request.path.as_str() {
+            "/v1/admin/snapshot" => {
+                app.db
+                    .snapshot()
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))?;
+                send_proto(conn, 200, AckResponse { affected: 1 })
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))
+            }
+            "/v1/admin/compact" => {
+                let stats = app
+                    .db
+                    .compact()
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))?;
+                send_proto(
+                    conn,
+                    200,
+                    AckResponse {
+                        affected: stats.messages as u64,
+                    },
+                )
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))
+            }
+            _ => Err(ApiError::not_found("unknown admin endpoint")),
+        };
     }
 
     let token = bearer_token(request).ok_or_else(|| ApiError::unauthorized("missing token"))?;
@@ -388,11 +452,11 @@ async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Res
             if let Some(outbound) = app.outbound.as_ref() {
                 for recipient in &request.envelope_to {
                     if app.registry.account(recipient).is_none()
-                        && outbound.enqueue(crate::outbound::OutboundJob {
-                            from: request.envelope_from.clone(),
-                            to: recipient.clone(),
-                            raw: request.raw.clone(),
-                        })
+                        && outbound.enqueue(crate::outbound::OutboundQueue::job(
+                            request.envelope_from.clone(),
+                            recipient.clone(),
+                            request.raw.clone(),
+                        ))
                     {
                         queued = true;
                     }
@@ -489,7 +553,7 @@ async fn send_response(
 ) -> std::io::Result<()> {
     let reason = status_text(status);
     let headers = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, X-Admin-Token\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n",
         body.len()
     );
     conn.write_all(headers.as_bytes()).await?;
@@ -506,6 +570,7 @@ fn status_text(status: u16) -> &'static str {
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
+        204 => "No Content",
         404 => "Not Found",
         409 => "Conflict",
         413 => "Payload Too Large",

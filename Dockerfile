@@ -18,6 +18,6 @@ RUN apt-get update \
 COPY --from=builder /src/target/release/tide /usr/local/bin/tide
 
 WORKDIR /data
-EXPOSE 8080 2525 5870 9093
+EXPOSE 8080 2525 465 5870 9093
 ENTRYPOINT ["tide"]
 CMD ["/etc/tide/tide.toml"]

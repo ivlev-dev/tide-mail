@@ -8,19 +8,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::{Mmap, MmapOptions};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use silent_protocol::SilentProto;
+use std::collections::BTreeMap;
 use tide_core::Message;
 use uuid::Uuid;
 
 use crate::batch::{
-    DecodedBatch, KIND_DELETE, KIND_FLAGS, KIND_MESSAGE, KIND_MOVE, NewBatch, Record, decode_batch,
+    DecodedBatch, KIND_DELETE, KIND_FLAGS, KIND_MESSAGE, KIND_META, KIND_MOVE, NewBatch, Record,
+    decode_batch,
 };
 use crate::change::{ChangeEntry, ChangesPage, SyncCursor, kind as change_kind};
 use crate::error::StoreError;
 use crate::format::{
-    DEFAULT_DATA_LANES, DEFAULT_LANE_CAPACITY, FIRST_DATA_LANE, FORMAT_VERSION, LANE_HEADER_SIZE,
-    LaneHeader, MAX_LANE_CAPACITY, MIN_LANE_CAPACITY, SUPERBLOCK_A_OFFSET, SUPERBLOCK_B_OFFSET,
-    SUPERBLOCK_SIZE, Superblock, file_size, lane_base, lane_data_start,
+    DEFAULT_DATA_LANES, DEFAULT_LANE_CAPACITY, FIRST_DATA_LANE, FORMAT_VERSION, INDEX_LANE,
+    LANE_HEADER_SIZE, LaneHeader, MAX_LANE_CAPACITY, MIN_LANE_CAPACITY, SUPERBLOCK_A_OFFSET,
+    SUPERBLOCK_B_OFFSET, SUPERBLOCK_SIZE, Superblock, file_size, lane_base, lane_data_start,
 };
 use crate::index::{SearchHit, SearchIndex, SearchQuery};
 use crate::lane::{Durability, LaneWriter, Receipt, replay_lane, spawn_lane, write_all_at};
@@ -80,7 +83,7 @@ impl StoreOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Location {
     lane_id: u16,
     batch_offset: u64,
@@ -110,6 +113,64 @@ pub struct StoreStats {
     pub messages: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct LanePosition {
+    lane: u16,
+    head: u64,
+    seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Snapshot {
+    version: u32,
+    index: SearchIndex,
+    catalog: HashMap<String, Location>,
+    changes: HashMap<String, Vec<ChangeEntry>>,
+    lanes: Vec<LanePosition>,
+}
+
+const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, SilentProto)]
+struct LanePositionWire {
+    head: u64,
+    lane: u32,
+    seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SilentProto)]
+struct SnapshotManifest {
+    chunks: u32,
+    #[proto(date)]
+    created_at: i64,
+    id: u64,
+    lanes: Vec<LanePositionWire>,
+}
+
+impl Snapshot {
+    fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        let bytes = bincode::serialize(self)
+            .map_err(|error| StoreError::Internal(format!("snapshot encode: {error}")))?;
+        zstd::bulk::compress(&bytes, 3)
+            .map_err(|error| StoreError::Internal(format!("snapshot compress: {error}")))
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
+        let decompressed = zstd::bulk::decompress(bytes, 1024 * 1024 * 1024)
+            .map_err(|error| StoreError::Internal(format!("snapshot decompress: {error}")))?;
+        let snapshot: Self = bincode::deserialize(&decompressed)
+            .map_err(|error| StoreError::Internal(format!("snapshot decode: {error}")))?;
+        if snapshot.version != SNAPSHOT_VERSION {
+            return Err(StoreError::corrupt(format!(
+                "unsupported snapshot version {}",
+                snapshot.version
+            )));
+        }
+        Ok(snapshot)
+    }
+}
+
 struct DbInner {
     path: PathBuf,
     mmap: Mmap,
@@ -121,11 +182,13 @@ struct DbInner {
     catalog: RwLock<HashMap<String, Location>>,
     changes: RwLock<HashMap<String, Vec<ChangeEntry>>>,
     lane_locks: Vec<Arc<futures::lock::Mutex<()>>>,
+    options: StoreOptions,
 }
 
 #[derive(Clone)]
 pub struct Db {
-    inner: Arc<DbInner>,
+    inner: Arc<arc_swap::ArcSwap<DbInner>>,
+    gate: Arc<async_lock::RwLock<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SilentProto)]
@@ -178,37 +241,111 @@ impl Db {
                 .map(&file)?
         };
 
-        let mut index = SearchIndex::new();
-        let mut catalog = HashMap::new();
-        let mut changes = HashMap::new();
+        let mut headers = Vec::with_capacity(superblock.lane_count as usize);
+        for lane_id in 0..superblock.lane_count {
+            let base = lane_base(&superblock, lane_id)?;
+            let data_start = lane_data_start(&superblock, lane_id)?;
+            headers.push(read_lane_header(
+                &file,
+                &superblock,
+                lane_id,
+                base,
+                data_start,
+            )?);
+        }
+
+        let index_base = lane_base(&superblock, INDEX_LANE)?;
+        let index_start = lane_data_start(&superblock, INDEX_LANE)?;
+        let (_, _, index_batches) =
+            replay_lane(&mmap, index_base, superblock.lane_capacity, index_start, 1)?;
+        let snapshot = load_snapshot(&index_batches)?;
+        let snapshot_positions: HashMap<u16, LanePosition> = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .lanes
+                    .iter()
+                    .map(|position| (position.lane, *position))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut index = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.index.clone())
+            .unwrap_or_default();
+        let mut catalog = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.catalog.clone())
+            .unwrap_or_default();
+        let mut changes = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.changes.clone())
+            .unwrap_or_default();
         let mut lanes = Vec::with_capacity(superblock.lane_count as usize);
         let mut init_ring = io_uring::IoUring::new(8).map_err(StoreError::Io)?;
 
         for lane_id in 0..superblock.lane_count {
             let base = lane_base(&superblock, lane_id)?;
             let data_start = lane_data_start(&superblock, lane_id)?;
-            let _header = read_lane_header(&file, &superblock, lane_id, base, data_start)?;
+            let header = &headers[lane_id as usize];
+            let position = snapshot_positions.get(&lane_id).copied();
+            let start = if lane_id == INDEX_LANE {
+                data_start
+            } else if lane_id >= FIRST_DATA_LANE {
+                match position {
+                    Some(position) => {
+                        if header.checkpoint_head >= data_start {
+                            header.checkpoint_head.min(position.head).max(data_start)
+                        } else {
+                            position.head.max(data_start)
+                        }
+                    }
+                    None => data_start,
+                }
+            } else {
+                data_start
+            };
+            let start_seq = header
+                .seq
+                .max(
+                    position
+                        .map(|position| position.seq.saturating_add(1))
+                        .unwrap_or(1),
+                )
+                .max(1);
             let (head, seq, batches) =
-                replay_lane(&mmap, base, superblock.lane_capacity, data_start, 1)?;
-            let mut offset = data_start;
-            for batch in &batches {
-                apply_batch_to_maps(
-                    lane_id,
-                    batch,
-                    offset,
-                    &mut index,
-                    &mut catalog,
-                    &mut changes,
-                )?;
-                offset += batch.total_len;
+                replay_lane(&mmap, base, superblock.lane_capacity, start, start_seq)?;
+            if lane_id >= FIRST_DATA_LANE {
+                let mut offset = start;
+                for batch in &batches {
+                    let already_present = position
+                        .map(|position| batch.seq <= position.seq)
+                        .unwrap_or(false);
+                    if !already_present {
+                        apply_batch_to_maps(
+                            lane_id,
+                            batch,
+                            offset,
+                            &mut index,
+                            &mut catalog,
+                            &mut changes,
+                        )?;
+                    }
+                    offset += batch.total_len;
+                }
             }
+            let (checkpoint_head, checkpoint_seq) = position
+                .filter(|_| lane_id >= FIRST_DATA_LANE)
+                .map(|position| (position.head, position.seq))
+                .unwrap_or((header.checkpoint_head, header.checkpoint_seq));
             let recovered = LaneHeader {
                 lane_id,
                 capacity: superblock.lane_capacity,
                 head,
                 seq,
-                checkpoint_seq: seq.saturating_sub(1),
-                checkpoint_head: head,
+                checkpoint_seq,
+                checkpoint_head,
             };
             write_all_at(
                 &mut init_ring,
@@ -224,6 +361,8 @@ impl Db {
                 superblock.lane_capacity,
                 head,
                 seq,
+                checkpoint_head,
+                checkpoint_seq,
                 options.durability,
             )?;
             lanes.push(writer);
@@ -244,31 +383,37 @@ impl Db {
             catalog: RwLock::new(catalog),
             changes: RwLock::new(changes),
             lane_locks,
+            options,
         };
         Ok(Self {
-            inner: Arc::new(inner),
+            inner: Arc::new(arc_swap::ArcSwap::from_pointee(inner)),
+            gate: Arc::new(async_lock::RwLock::new(())),
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.inner.path
+    fn state(&self) -> Arc<DbInner> {
+        self.inner.load_full()
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.state().path.clone()
     }
 
     pub fn stats(&self) -> StoreStats {
         StoreStats {
-            path: self.inner.path.clone(),
-            generation: self.inner.generation.load(Ordering::Relaxed),
-            data_lanes: self.inner.superblock.data_lanes,
-            lane_capacity: self.inner.superblock.lane_capacity,
-            messages: self.inner.index.read().len(),
+            path: self.state().path.clone(),
+            generation: self.state().generation.load(Ordering::Relaxed),
+            data_lanes: self.state().superblock.data_lanes,
+            lane_capacity: self.state().superblock.lane_capacity,
+            messages: self.state().index.read().len(),
         }
     }
 
     pub fn lane_for_account(&self, account_id: &str) -> LaneWriter {
-        let data_lanes = self.inner.superblock.data_lanes;
+        let data_lanes = self.state().superblock.data_lanes;
         let slot = (fnv1a(account_id.as_bytes()) % u64::from(data_lanes)) as u16;
         let lane_id = FIRST_DATA_LANE + slot;
-        self.inner.lanes[lane_id as usize].clone()
+        self.state().lanes[lane_id as usize].clone()
     }
 
     pub async fn append_message(&self, message: Message) -> Result<Receipt, StoreError> {
@@ -287,13 +432,14 @@ impl Db {
         account_id: &str,
         batch: NewBatch,
     ) -> Result<Receipt, StoreError> {
+        let _gate = self.gate.read().await;
         if account_id.is_empty() {
             return Err(StoreError::Config("empty account id".into()));
         }
         validate_batch(account_id, &batch)?;
         let records = batch.records.clone();
         let lane = self.lane_for_account(account_id);
-        let lock = self.inner.lane_locks[lane.lane_id() as usize].clone();
+        let lock = self.state().lane_locks[lane.lane_id() as usize].clone();
         let _guard = lock.lock().await;
         let receipt = lane.append(batch).await?;
         self.apply_committed_records(
@@ -315,7 +461,7 @@ impl Db {
     }
 
     pub fn get_message(&self, id: &str) -> Result<Option<Message>, StoreError> {
-        let location = match self.inner.catalog.read().get(id).copied() {
+        let location = match self.state().catalog.read().get(id).copied() {
             Some(location) => location,
             None => return Ok(None),
         };
@@ -326,16 +472,16 @@ impl Db {
         let end = start
             .checked_add(length)
             .ok_or_else(|| StoreError::corrupt("batch end overflow"))?;
-        if end > self.inner.mmap.len() {
+        if end > self.state().mmap.len() {
             return Err(StoreError::corrupt("batch outside mmap"));
         }
-        let decoded = decode_batch(&self.inner.mmap[start..end])?;
+        let decoded = decode_batch(&self.state().mmap[start..end])?;
         let record = decoded
             .records
             .get(location.record_index)
             .ok_or_else(|| StoreError::corrupt("record index out of bounds"))?;
         let mut message = Message::decode(&record.payload)?;
-        if let Some(doc) = self.inner.index.read().get(id) {
+        if let Some(doc) = self.state().index.read().get(id) {
             message.flags = doc.flags;
             message.account_id = doc.account_id.clone();
             message.mailbox = doc.mailbox.clone();
@@ -344,15 +490,16 @@ impl Db {
     }
 
     pub fn search(&self, query: &SearchQuery) -> Vec<SearchHit> {
-        self.inner.index.read().search(query)
+        self.state().index.read().search(query)
     }
 
     pub fn index_size(&self) -> usize {
-        self.inner.index.read().len()
+        self.state().index.read().len()
     }
 
     pub fn account_stats(&self, account_id: &str) -> AccountStats {
-        let index = self.inner.index.read();
+        let inner = self.state();
+        let index = inner.index.read();
         let mut stats = AccountStats::default();
         for doc in index.iter().filter(|doc| doc.account_id == account_id) {
             stats.total += 1;
@@ -370,8 +517,8 @@ impl Db {
 
     pub fn sync_cursor(&self, account_id: &str) -> SyncCursor {
         let lane = self.lane_for_account(account_id).lane_id();
-        let seq = self
-            .inner
+        let inner = self.state();
+        let seq = inner
             .changes
             .read()
             .get(account_id)
@@ -381,7 +528,8 @@ impl Db {
     }
 
     pub fn sync_changes(&self, account_id: &str, since_seq: u64, limit: u32) -> ChangesPage {
-        let changes = self.inner.changes.read();
+        let inner = self.state();
+        let changes = inner.changes.read();
         let entries = match changes.get(account_id) {
             Some(entries) => entries,
             None => {
@@ -412,7 +560,8 @@ impl Db {
     }
 
     pub fn all_changes(&self, account_id: &str) -> Vec<ChangeEntry> {
-        self.inner
+        let inner = self.state();
+        inner
             .changes
             .read()
             .get(account_id)
@@ -421,35 +570,37 @@ impl Db {
     }
 
     pub async fn delete_message(&self, id: &str) -> Result<Receipt, StoreError> {
+        let _gate = self.gate.read().await;
         let location = self.location(id)?;
-        let lane = self
-            .inner
+        let inner = self.state();
+        let lane = inner
             .lanes
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
-        let lock = self.inner.lane_locks[lane.lane_id() as usize].clone();
+        let lock = self.state().lane_locks[lane.lane_id() as usize].clone();
         let _guard = lock.lock().await;
         let receipt = lane.append(NewBatch::single(Record::delete(id))).await?;
-        self.inner.index.write().delete(id);
-        self.inner.catalog.write().remove(id);
+        self.state().index.write().delete(id);
+        self.state().catalog.write().remove(id);
         Ok(receipt)
     }
 
     pub async fn update_flags(&self, id: &str, flags: u64) -> Result<Receipt, StoreError> {
+        let _gate = self.gate.read().await;
         let location = self.location(id)?;
-        let lane = self
-            .inner
+        let inner = self.state();
+        let lane = inner
             .lanes
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
-        let lock = self.inner.lane_locks[lane.lane_id() as usize].clone();
+        let lock = self.state().lane_locks[lane.lane_id() as usize].clone();
         let _guard = lock.lock().await;
         let receipt = lane
             .append(NewBatch::single(Record::flags(id, flags)))
             .await?;
-        self.inner.index.write().update_flags(id, flags);
+        self.state().index.write().update_flags(id, flags);
         Ok(receipt)
     }
 
@@ -459,14 +610,15 @@ impl Db {
         account_id: &str,
         mailbox: &str,
     ) -> Result<Receipt, StoreError> {
+        let _gate = self.gate.read().await;
         let location = self.location(id)?;
-        let lane = self
-            .inner
+        let inner = self.state();
+        let lane = inner
             .lanes
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
-        let lock = self.inner.lane_locks[lane.lane_id() as usize].clone();
+        let lock = self.state().lane_locks[lane.lane_id() as usize].clone();
         let _guard = lock.lock().await;
         let payload = MovePayload {
             account_id: account_id.to_string(),
@@ -476,22 +628,111 @@ impl Db {
         let receipt = lane
             .append(NewBatch::single(Record::new(KIND_MOVE, id, payload)))
             .await?;
-        self.inner
-            .index
-            .write()
-            .move_message(id, account_id, mailbox);
+        inner.index.write().move_message(id, account_id, mailbox);
         Ok(receipt)
     }
 
     pub async fn flush(&self) -> Result<(), StoreError> {
-        for lane in &self.inner.lanes {
-            lane.checkpoint().await?;
+        self.snapshot().await
+    }
+
+    pub async fn snapshot(&self) -> Result<(), StoreError> {
+        let _guard = self.gate.write().await;
+        let mut positions = Vec::new();
+        for lane_id in FIRST_DATA_LANE..self.state().superblock.lane_count {
+            let lane = &self.state().lanes[lane_id as usize];
+            let info = lane.info().await?;
+            positions.push(LanePosition {
+                lane: lane_id,
+                head: info.head,
+                seq: info.seq.saturating_sub(1),
+            });
+        }
+        let snapshot = Snapshot {
+            version: SNAPSHOT_VERSION,
+            index: self.state().index.read().clone(),
+            catalog: self.state().catalog.read().clone(),
+            changes: self.state().changes.read().clone(),
+            lanes: positions.clone(),
+        };
+        let bytes = snapshot.encode()?;
+        let id = next_snapshot_id();
+        let index_lane = self.state().lanes[INDEX_LANE as usize].clone();
+        let chunk_count = bytes.len().div_ceil(SNAPSHOT_CHUNK_SIZE).max(1) as u32;
+        for (index, chunk) in bytes.chunks(SNAPSHOT_CHUNK_SIZE).enumerate() {
+            index_lane
+                .append(NewBatch::single(Record::new(
+                    KIND_META,
+                    format!("snap:{id}:{index}"),
+                    chunk.to_vec(),
+                )))
+                .await?;
+        }
+        let manifest = SnapshotManifest {
+            chunks: chunk_count,
+            created_at: crate::batch::now_millis(),
+            id,
+            lanes: positions
+                .iter()
+                .map(|position| LanePositionWire {
+                    head: position.head,
+                    lane: u32::from(position.lane),
+                    seq: position.seq,
+                })
+                .collect(),
+        };
+        index_lane
+            .append(NewBatch::single(Record::new(
+                KIND_META,
+                format!("snap:{id}"),
+                manifest.encode()?,
+            )))
+            .await?;
+        for position in &positions {
+            self.state().lanes[position.lane as usize]
+                .set_checkpoint(position.head, position.seq)
+                .await?;
         }
         self.persist_superblock()
     }
 
+    pub async fn compact(&self) -> Result<StoreStats, StoreError> {
+        let _gate = self.gate.write().await;
+        let old = self.state();
+        let path = old.path.clone();
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| StoreError::Config("invalid database path".into()))?;
+        let temp = path.with_file_name(format!("{file_name}.compact"));
+        if temp.exists() {
+            std::fs::remove_file(&temp)?;
+        }
+        let new_db = Db::open(&temp, old.options.clone())?;
+        let ids = old
+            .index
+            .read()
+            .iter()
+            .map(|doc| doc.id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Some(message) = self.get_message(&id)? {
+                new_db.append_message(message).await?;
+            }
+        }
+        new_db.flush().await?;
+        drop(new_db);
+        std::fs::rename(&temp, &path)?;
+        let reopened = Db::open(&path, old.options.clone())?;
+        let new_inner = reopened.state();
+        self.inner.store(new_inner);
+        drop(old);
+        Ok(self.stats())
+    }
+
     fn location(&self, id: &str) -> Result<Location, StoreError> {
-        self.inner
+        let inner = self.state();
+        inner
             .catalog
             .read()
             .get(id)
@@ -507,9 +748,10 @@ impl Db {
         seq: u64,
         records: &[Record],
     ) -> Result<(), StoreError> {
-        let mut index = self.inner.index.write();
-        let mut catalog = self.inner.catalog.write();
-        let mut changes = self.inner.changes.write();
+        let inner = self.state();
+        let mut index = inner.index.write();
+        let mut catalog = inner.catalog.write();
+        let mut changes = inner.changes.write();
         for (record_index, record) in records.iter().enumerate() {
             match record.kind {
                 KIND_MESSAGE => {
@@ -562,31 +804,91 @@ impl Db {
     }
 
     fn persist_superblock(&self) -> Result<(), StoreError> {
-        let generation = self
-            .inner
+        let inner = self.state();
+        let generation = inner
             .generation
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
-        let mut superblock = self.inner.superblock.clone();
+        let mut superblock = inner.superblock.clone();
         superblock.generation = generation;
         let bytes = superblock.encode();
         let mut ring = io_uring::IoUring::new(8).map_err(StoreError::Io)?;
         write_all_at(
             &mut ring,
-            self.inner.file.as_raw_fd(),
+            inner.file.as_raw_fd(),
             &bytes,
             SUPERBLOCK_A_OFFSET,
             true,
         )?;
         write_all_at(
             &mut ring,
-            self.inner.file.as_raw_fd(),
+            inner.file.as_raw_fd(),
             &bytes,
             SUPERBLOCK_B_OFFSET,
             true,
         )?;
         Ok(())
     }
+}
+
+fn load_snapshot(batches: &[DecodedBatch]) -> Result<Option<Snapshot>, StoreError> {
+    let mut manifests: BTreeMap<u64, SnapshotManifest> = BTreeMap::new();
+    let mut chunks: BTreeMap<u64, BTreeMap<u32, Vec<u8>>> = BTreeMap::new();
+    for batch in batches {
+        for record in &batch.records {
+            if record.kind != KIND_META {
+                continue;
+            }
+            let Some(rest) = record.key.strip_prefix("snap:") else {
+                continue;
+            };
+            let mut parts = rest.split(':');
+            let Some(id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+                continue;
+            };
+            match parts.next() {
+                None => {
+                    if let Ok(manifest) = SnapshotManifest::decode(&record.payload) {
+                        manifests.insert(id, manifest);
+                    }
+                }
+                Some(index) => {
+                    if let Ok(index) = index.parse::<u32>() {
+                        chunks
+                            .entry(id)
+                            .or_default()
+                            .insert(index, record.payload.clone());
+                    }
+                }
+            }
+        }
+    }
+    for (id, manifest) in manifests.iter().rev() {
+        let Some(chunk_map) = chunks.get(id) else {
+            continue;
+        };
+        if chunk_map.len() != manifest.chunks as usize {
+            continue;
+        }
+        let mut payload = Vec::new();
+        for index in 0..manifest.chunks {
+            let Some(chunk) = chunk_map.get(&index) else {
+                payload.clear();
+                break;
+            };
+            payload.extend_from_slice(chunk);
+        }
+        if payload.is_empty() {
+            continue;
+        }
+        match Snapshot::decode(&payload) {
+            Ok(snapshot) => return Ok(Some(snapshot)),
+            Err(error) => {
+                eprintln!("snapshot {id} is invalid: {error}");
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn initialize_file(file: &File, options: &StoreOptions) -> Result<(), StoreError> {
@@ -793,6 +1095,13 @@ fn lock_file(file: &File) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn next_snapshot_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let millis = crate::batch::now_millis().max(0) as u64;
+    (millis << 16) | (COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFFFF)
+}
+
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in bytes {
@@ -936,6 +1245,88 @@ mod tests {
         let page = db.sync_changes("alice", 0, 10);
         assert_eq!(page.entries.len(), 2);
         assert_eq!(db.sync_cursor("alice").seq, 2);
+    }
+
+    #[test]
+    fn snapshot_replays_only_new_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.tide");
+        let db = Db::open(&path, options()).unwrap();
+        db.append_message_blocking(message("1", "alice", "Snapshot", "old body"))
+            .unwrap();
+        futures::executor::block_on(db.flush()).unwrap();
+        db.append_message_blocking(message("2", "alice", "After snapshot", "new body"))
+            .unwrap();
+        drop(db);
+
+        let db = Db::open(&path, options()).unwrap();
+        assert_eq!(db.index_size(), 2);
+        assert_eq!(db.get_message("1").unwrap().unwrap().subject, "Snapshot");
+        assert_eq!(
+            db.get_message("2").unwrap().unwrap().subject,
+            "After snapshot"
+        );
+        assert_eq!(
+            db.search(&SearchQuery::new().account("alice").text("snapshot"))
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn compaction_preserves_messages_and_allows_new_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.tide");
+        let db = Db::open(&path, options()).unwrap();
+        for index in 0..20 {
+            db.append_message_blocking(message(
+                &format!("m{index}"),
+                "alice",
+                &format!("Subject {index}"),
+                "body for compaction",
+            ))
+            .unwrap();
+        }
+        futures::executor::block_on(db.delete_message("m0")).unwrap();
+        futures::executor::block_on(db.update_flags("m1", tide_core::flags::SEEN)).unwrap();
+        futures::executor::block_on(db.flush()).unwrap();
+        let stats = futures::executor::block_on(db.compact()).unwrap();
+        assert_eq!(stats.messages, 19);
+        assert!(db.get_message("m0").unwrap().is_none());
+        assert!(db.get_message("m1").unwrap().unwrap().is_read());
+        db.append_message_blocking(message("m-new", "alice", "After compact", "body"))
+            .unwrap();
+        assert_eq!(db.index_size(), 20);
+        drop(db);
+        let db = Db::open(&path, options()).unwrap();
+        assert_eq!(db.index_size(), 20);
+        assert!(db.get_message("m-new").unwrap().is_some());
+    }
+
+    #[test]
+    fn compaction_waits_for_concurrent_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mail.tide");
+        let db = Db::open(&path, options()).unwrap();
+        let writer = db.clone();
+        let handle = std::thread::spawn(move || {
+            for index in 0..100 {
+                writer
+                    .append_message_blocking(message(
+                        &format!("c{index}"),
+                        "alice",
+                        &format!("Concurrent {index}"),
+                        "body",
+                    ))
+                    .unwrap();
+            }
+        });
+        futures::executor::block_on(db.compact()).unwrap();
+        handle.join().unwrap();
+        assert_eq!(db.index_size(), 100);
+        drop(db);
+        let db = Db::open(&path, options()).unwrap();
+        assert_eq!(db.index_size(), 100);
     }
 
     #[test]
