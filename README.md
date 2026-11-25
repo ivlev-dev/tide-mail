@@ -169,8 +169,8 @@ cargo test --workspace
 
 E2E-тест (`crates/tide-server/tests/e2e.rs`) поднимает сервер и проверяет:
 
-1. SMTP-доставку;
-2. бинарный REST login/search/get/list/flags;
+1. SMTP-доставку и маршрутизацию спама в `Junk`;
+2. бинарный REST login/search/get/list/flags, папки, вложения, download;
 3. sync handshake, pull, push flags и `PUT_MESSAGE`;
 4. snapshot и online-компакцию через admin API.
 
@@ -186,8 +186,8 @@ E2E-тест (`crates/tide-server/tests/e2e.rs`) поднимает сервер
 ## Roadmap
 
 - Векторный семантический поиск и эмбеддинги (секция в формате зарезервирована).
-- MTA-STS/DANE, DSN/bounce-обработка.
 - ACL на уровне папок и JMAP-совместимый шлюз.
+- Rate limit, audit log, virus-scan hook и шардирование postings.
 
 ## Лицензия
 
