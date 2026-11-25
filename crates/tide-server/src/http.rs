@@ -258,6 +258,39 @@ async fn route(app: &App, conn: &mut BufferedConn, request: &HttpRequest) -> Res
                     .await
                     .map_err(|error| ApiError::internal(error.to_string()))
             }
+            "/v1/admin/rescan" => {
+                let Some(queue) = app.scan_queue.as_ref() else {
+                    return Err(ApiError::unavailable("async antivirus is not enabled"));
+                };
+                let queued = queue.rescan_all(&app.db);
+                send_proto(
+                    conn,
+                    200,
+                    AckResponse {
+                        affected: queued as u64,
+                    },
+                )
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))
+            }
+            "/v1/admin/gc-blobs" => {
+                let removed = app
+                    .db
+                    .gc_blobs(std::time::Duration::from_secs(
+                        app.config.server.blob_gc_grace_secs,
+                    ))
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))?;
+                send_proto(
+                    conn,
+                    200,
+                    AckResponse {
+                        affected: removed as u64,
+                    },
+                )
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))
+            }
             "/v1/admin/backup" => {
                 let Some(root) = app.config.server.backup_dir.as_ref() else {
                     return Err(ApiError::unavailable("backup_dir is not configured"));

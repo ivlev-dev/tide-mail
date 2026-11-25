@@ -157,16 +157,23 @@ async fn deliver(
             }
         }
     }
-    if let Some(scanner) = app.antivirus.clone() {
-        let raw = data.clone();
-        let handle = monoio::spawn_blocking(move || scanner.scan(&raw));
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!("antivirus rejected message: {error}");
-                return tide_smtp::Reply::new(550, "5.7.1 Message rejected by antivirus scanner");
+    let async_quarantine =
+        !submission && app.config.antivirus.async_scan && app.scan_queue.is_some();
+    if !async_quarantine {
+        if let Some(scanner) = app.antivirus.clone() {
+            let raw = data.clone();
+            let handle = monoio::spawn_blocking(move || scanner.scan(&raw));
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("antivirus rejected message: {error}");
+                    return tide_smtp::Reply::new(
+                        550,
+                        "5.7.1 Message rejected by antivirus scanner",
+                    );
+                }
+                Err(_) => eprintln!("antivirus task cancelled"),
             }
-            Err(_) => eprintln!("antivirus task cancelled"),
         }
     }
     if !submission && crate::dsn::is_dsn(&data) {
@@ -250,9 +257,15 @@ async fn deliver(
         if let Err(error) = app.db.ensure_default_folders(&recipient).await {
             eprintln!("folders: {error}");
         }
-        let mailbox = if spam { "Junk" } else { "INBOX" };
+        let mailbox = if spam {
+            "Junk"
+        } else if async_quarantine {
+            "Quarantine"
+        } else {
+            "INBOX"
+        };
         let id = Uuid::new_v4().to_string();
-        let message = match parse_message(&data, recipient.clone(), mailbox, id) {
+        let message = match parse_message(&data, recipient.clone(), mailbox, id.clone()) {
             Ok(message) => message,
             Err(error) => {
                 eprintln!("smtp parse: {error}");
@@ -262,6 +275,11 @@ async fn deliver(
         if let Err(error) = app.db.append_message_with_blobs(message).await {
             eprintln!("smtp store: {error}");
             return tide_smtp::Reply::new(451, "4.3.0 Temporary storage failure");
+        }
+        if async_quarantine {
+            if let Some(queue) = app.scan_queue.as_ref() {
+                queue.enqueue(id, recipient.clone(), true);
+            }
         }
     }
     SmtpSession::message_accepted()

@@ -52,6 +52,8 @@ Authorization: Bearer <token>
 | POST | `/v1/admin/snapshot` | — | `AckResponse` |
 | POST | `/v1/admin/compact` | — | `AckResponse` |
 | POST | `/v1/admin/backup` | — | `AckResponse` |
+| POST | `/v1/admin/gc-blobs` | — | `AckResponse` |
+| POST | `/v1/admin/rescan` | — | `AckResponse` |
 
 `account_id` во всех запросах должен совпадать с аккаунтом токена.
 

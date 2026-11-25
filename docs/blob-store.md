@@ -35,9 +35,25 @@ key = blobref:<message_id>:<attachment_id>
 
 `Db::get_attachment` сначала смотрит inline `data`, затем `blobref` + blob-store. API download и sync `BLOB_REQUEST` используют этот метод.
 
+## S3 backend
+
+```toml
+[blob]
+backend = "s3"
+bucket = "tide-mail"
+region = "us-east-1"
+endpoint = "https://s3.example.com"
+access_key_id = "..."
+secret_access_key = "..."
+prefix = "blobs"
+allow_http = false
+```
+
+Поддерживается любой S3-совместимый сервис (MinIO, R2, Wasabi). Ключ объекта — `<prefix>/<sha256>`. S3-режим использует `object_store`; локальный кеш не ведётся.
+
 ## Обслуживание
 
 - `compact` перечитывает blob из старого store и заново раскладывает в новый.
 - `backup_to` копирует `mail.tide` и каталог `blobs`.
-- Осиротевшие blob'ы после упавшей записи не удаляются автоматически; нужна GC-задача (roadmap).
+- GC: `POST /v1/admin/gc-blobs` удаляет нереференсные объекты старше `blob_gc_grace_secs` (по умолчанию 3600).
 - Каталог задаётся `server.blob_dir`; по умолчанию рядом с `mail.tide` в `blobs/`.

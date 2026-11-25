@@ -2,6 +2,31 @@
 
 Проверка вложений/сырого письма перед сохранением.
 
+## Синхронный и асинхронный режим
+
+```toml
+[antivirus]
+enabled = true
+async_scan = false
+quarantine_folder = "Quarantine"
+infected_folder = "Virus"
+```
+
+- `async_scan = false` — письмо сканируется до ответа SMTP/API.
+- `async_scan = true` — входящее письмо сразу кладётся в `Quarantine`, SMTP отвечает `250`, фоновый поток сканирует:
+  - clean → `INBOX`;
+  - infected → `Virus`;
+  - scanner error → остаётся в `Quarantine`.
+
+Rescan существующих писем:
+
+```http
+POST /v1/admin/rescan
+X-Admin-Token: ...
+```
+
+При старте воркер сам ставит в очередь всё, что лежит в `Quarantine`.
+
 ## Режимы
 
 - **ClamAV TCP**: `INSTREAM`-протокол на `clamav_addr` (обычно `127.0.0.1:3310`).
@@ -33,7 +58,7 @@ blob_dir = "./data/blobs"
 
 ## Ограничения
 
-- Нет карантина: письмо не сохраняется.
-- Нет асинхронного scan-queue; при медленном ClamAV SMTP-сессия ждёт.
+- Карантин — папка, без UI release; письмо можно переместить вручную через API/IMAP-клиент.
+- Async scan использует in-memory очередь; после рестарта Quarantine пересканируется.
 - Нет проверки уже сохранённых писем и повторного scan при обновлении баз.
 - External command — доверенная конфигурация администратора.

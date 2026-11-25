@@ -10,6 +10,8 @@
 | `data_path` | path | файл `mail.tide` |
 | `blob_dir` | path? | blob-store вложений |
 | `backup_dir` | path? | каталог backup-эндпоинта |
+| `blob_gc_grace_secs` | u64 | grace period GC |
+| `standby` | bool | ждать освобождения БД и стать primary |
 | `data_lanes` | u16 | число data-lane (1..128) |
 | `lane_capacity_mb` | u64 | ёмкость одного lane, МиБ |
 | `workers` | usize | число io_uring-воркеров |
@@ -49,10 +51,26 @@ reject_dmarc_fail = false
 
 Требует системный DNS resolver.
 
+## `[blob]`
+
+```toml
+backend = "local" # или "s3"
+bucket = "tide-mail"
+region = "us-east-1"
+endpoint = "https://s3.example.com"
+access_key_id = "..."
+secret_access_key = "..."
+prefix = "blobs"
+allow_http = false
+```
+
 ## `[antivirus]`
 
 ```toml
 enabled = true
+async_scan = false
+quarantine_folder = "Quarantine"
+infected_folder = "Virus"
 clamav_addr = "127.0.0.1:3310"
 # command = "clamdscan"
 ```

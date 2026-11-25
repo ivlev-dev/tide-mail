@@ -8,6 +8,7 @@ mod http;
 mod mime_build;
 mod net;
 mod outbound;
+mod scan_queue;
 mod smtp;
 mod sync_server;
 mod tls;
@@ -37,7 +38,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let db = match Db::open(&config.server.data_path, {
+    let store_options = {
         let options = StoreOptions::default()
             .with_data_lanes(config.server.data_lanes)
             .with_lane_capacity(
@@ -47,16 +48,38 @@ fn main() {
                     .saturating_mul(1024 * 1024)
                     .max(4 * 1024 * 1024),
             );
-        if let Some(blob_dir) = &config.server.blob_dir {
+        let options = if let Some(blob_dir) = &config.server.blob_dir {
             options.with_blob_dir(blob_dir)
         } else {
             options
+        };
+        if config.blob.backend.eq_ignore_ascii_case("s3") {
+            options.with_s3(tide_store::S3Config {
+                bucket: config.blob.bucket.clone(),
+                region: config.blob.region.clone(),
+                endpoint: config.blob.endpoint.clone(),
+                access_key_id: config.blob.access_key_id.clone(),
+                secret_access_key: config.blob.secret_access_key.clone(),
+                prefix: config.blob.prefix.clone(),
+                allow_http: config.blob.allow_http,
+            })
+        } else {
+            options
         }
-    }) {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!("не удалось открыть хранилище: {error}");
-            std::process::exit(1);
+    };
+    let db = loop {
+        match Db::open(&config.server.data_path, store_options.clone()) {
+            Ok(db) => break db,
+            Err(tide_store::StoreError::Locked) if config.server.standby => {
+                eprintln!("standby: database is locked by primary, retrying");
+                std::thread::sleep(std::time::Duration::from_secs(
+                    config.server.standby_retry_secs.max(1),
+                ));
+            }
+            Err(error) => {
+                eprintln!("не удалось открыть хранилище: {error}");
+                std::process::exit(1);
+            }
         }
     };
     let registry = match Registry::new(&config.accounts, config.server.token_ttl_hours) {
@@ -115,6 +138,18 @@ fn main() {
     } else {
         None
     };
+    let scan_queue = if config.antivirus.enabled && config.antivirus.async_scan {
+        antivirus.clone().map(|scanner| {
+            scan_queue::ScanQueue::start(
+                db.clone(),
+                scanner,
+                config.antivirus.quarantine_folder.clone(),
+                config.antivirus.infected_folder.clone(),
+            )
+        })
+    } else {
+        None
+    };
     let outbound = if config.server.outbound_enabled {
         let outbound_dir = config
             .server
@@ -142,6 +177,7 @@ fn main() {
         email_auth,
         spam,
         antivirus,
+        scan_queue,
     );
 
     println!(

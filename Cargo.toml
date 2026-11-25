@@ -25,6 +25,8 @@ libc = "0.2"
 mail-parser = { version = "1", features = ["full_encoding"] }
 memmap2 = "0.9"
 parking_lot = "0.12"
+bytes = "1"
+object_store = { version = "0.14", features = ["aws"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 proptest = "1"
 roaring = "0.10"

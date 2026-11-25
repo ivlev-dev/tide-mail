@@ -25,7 +25,18 @@ self_signed = true
 
 [antivirus]
 enabled = false
+async_scan = false
 # clamav_addr = "127.0.0.1:3310"
+
+[blob]
+backend = "local"
+# bucket = "tide-mail"
+# region = "us-east-1"
+# endpoint = "https://s3.example.com"
+# access_key_id = "..."
+# secret_access_key = "..."
+# prefix = "blobs"
+# allow_http = false
 
 [spam]
 enabled = true

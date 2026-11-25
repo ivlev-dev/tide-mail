@@ -40,9 +40,21 @@ systemctl start tide
 
 Либо указать `data_path`/`blob_dir` на backup-каталог и запустить отдельный экземпляр для проверки.
 
-## HA: active-passive
+## HA: standby на общем хранилище
 
-Полноценного консенсуса/репликации пока нет. Рабочая схема:
+`server.standby = true` — процесс пытается открыть БД; если файл занят primary (`flock`), ждёт `standby_retry_secs` и повторяет. Когда primary умирает, standby автоматически acquires lock и начинает обслуживать.
+
+```toml
+[server]
+standby = true
+standby_retry_secs = 2
+```
+
+Это даёт автоматический failover для общего volume. Разделяемого консенсуса нет; split-brain предотвращается `flock`.
+
+## HA: backup + orchestrator
+
+Если общего volume нет, используйте актив-пассив через backup:
 
 - один **active** экземпляр владеет `mail.tide` (flock не даст запустить второй writer);
 - периодический `POST /v1/admin/backup` на общий backup-volume;

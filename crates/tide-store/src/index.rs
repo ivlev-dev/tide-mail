@@ -867,8 +867,12 @@ fn is_stopword(word: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShardedIndex {
+pub struct ShardedIndexSnapshot {
     shards: Vec<SearchIndex>,
+}
+
+pub struct ShardedIndex {
+    shards: Vec<RwLock<SearchIndex>>,
 }
 
 impl Default for ShardedIndex {
@@ -880,7 +884,25 @@ impl Default for ShardedIndex {
 impl ShardedIndex {
     pub fn new(shards: usize) -> Self {
         Self {
-            shards: (0..shards.max(1)).map(|_| SearchIndex::new()).collect(),
+            shards: (0..shards.max(1))
+                .map(|_| RwLock::new(SearchIndex::new()))
+                .collect(),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: ShardedIndexSnapshot) -> Self {
+        Self {
+            shards: snapshot.shards.into_iter().map(RwLock::new).collect(),
+        }
+    }
+
+    pub fn snapshot(&self) -> ShardedIndexSnapshot {
+        ShardedIndexSnapshot {
+            shards: self
+                .shards
+                .iter()
+                .map(|shard| shard.read().clone())
+                .collect(),
         }
     }
 
@@ -893,58 +915,60 @@ impl ShardedIndex {
         (hash as usize) % self.shards.len()
     }
 
-    pub fn insert(&mut self, message: &Message) {
+    fn find_shard(&self, id: &str) -> Option<usize> {
+        self.shards
+            .iter()
+            .position(|shard| shard.read().by_id.contains_key(id))
+    }
+
+    pub fn insert(&self, message: &Message) {
+        if self.find_shard(&message.id).is_some() {
+            self.delete(&message.id);
+        }
         let shard = self.shard_for(&message.account_id);
-        self.shards[shard].insert(message);
+        self.shards[shard].write().insert(message);
     }
 
-    pub fn delete(&mut self, id: &str) {
-        for shard in &mut self.shards {
-            if shard.by_id.contains_key(id) {
-                shard.delete(id);
-                return;
-            }
+    pub fn delete(&self, id: &str) {
+        if let Some(shard) = self.find_shard(id) {
+            self.shards[shard].write().delete(id);
         }
     }
 
-    pub fn update_flags(&mut self, id: &str, flags: u64) {
-        for shard in &mut self.shards {
-            if shard.by_id.contains_key(id) {
-                shard.update_flags(id, flags);
-                return;
-            }
+    pub fn update_flags(&self, id: &str, flags: u64) {
+        if let Some(shard) = self.find_shard(id) {
+            self.shards[shard].write().update_flags(id, flags);
         }
     }
 
-    pub fn move_message(&mut self, id: &str, account_id: &str, mailbox: &str) {
+    pub fn move_message(&self, id: &str, account_id: &str, mailbox: &str) {
+        let Some(old_shard) = self.find_shard(id) else {
+            return;
+        };
         let target = self.shard_for(account_id);
-        let mut moved = None;
-        for (index, shard) in self.shards.iter_mut().enumerate() {
-            if shard.by_id.contains_key(id) {
-                if index == target {
-                    shard.move_message(id, account_id, mailbox);
-                    return;
-                }
-                if let Some(doc) = shard.get(id).cloned() {
-                    shard.delete(id);
-                    moved = Some(doc);
-                }
-                break;
-            }
+        if old_shard == target {
+            self.shards[target]
+                .write()
+                .move_message(id, account_id, mailbox);
+            return;
         }
-        if let Some(mut doc) = moved {
+        let doc = self.shards[old_shard].read().get(id).cloned();
+        if let Some(mut doc) = doc {
+            self.shards[old_shard].write().delete(id);
             doc.account_id = account_id.to_string();
             doc.mailbox = mailbox.to_string();
-            self.shards[target].insert_doc(doc);
+            self.shards[target].write().insert_doc(doc);
         }
     }
 
-    pub fn get(&self, id: &str) -> Option<&Doc> {
-        self.shards.iter().find_map(|shard| shard.get(id))
+    pub fn get(&self, id: &str) -> Option<Doc> {
+        self.shards
+            .iter()
+            .find_map(|shard| shard.read().get(id).cloned())
     }
 
     pub fn len(&self) -> usize {
-        self.shards.iter().map(SearchIndex::len).sum()
+        self.shards.iter().map(|shard| shard.read().len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -954,12 +978,19 @@ impl ShardedIndex {
     pub fn ids(&self) -> Vec<String> {
         self.shards
             .iter()
-            .flat_map(|shard| shard.iter().map(|doc| doc.id.clone()))
+            .flat_map(|shard| {
+                shard
+                    .read()
+                    .iter()
+                    .map(|doc| doc.id.clone())
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
     pub fn docs_for_account(&self, account_id: &str) -> Vec<Doc> {
         self.shards[self.shard_for(account_id)]
+            .read()
             .iter()
             .filter(|doc| doc.account_id == account_id)
             .cloned()
@@ -968,6 +999,7 @@ impl ShardedIndex {
 
     pub fn ids_in_folder(&self, account_id: &str, mailbox: &str) -> Vec<String> {
         self.shards[self.shard_for(account_id)]
+            .read()
             .iter()
             .filter(|doc| doc.account_id == account_id && doc.mailbox == mailbox)
             .map(|doc| doc.id.clone())
@@ -976,7 +1008,7 @@ impl ShardedIndex {
 
     pub fn search(&self, query: &SearchQuery) -> Vec<SearchHit> {
         if let Some(account) = &query.account_id {
-            return self.shards[self.shard_for(account)].search(query);
+            return self.shards[self.shard_for(account)].read().search(query);
         }
         let limit = query.limit.clamp(1, MAX_LIMIT);
         let mut hits = self
@@ -986,7 +1018,7 @@ impl ShardedIndex {
                 let mut shard_query = query.clone();
                 shard_query.limit = (query.offset + limit).min(MAX_LIMIT);
                 shard_query.offset = 0;
-                shard.search(&shard_query)
+                shard.read().search(&shard_query)
             })
             .collect::<Vec<_>>();
         hits.sort_by(|left, right| {
@@ -1049,7 +1081,7 @@ mod tests {
 
     #[test]
     fn sharded_index_routes_and_moves_accounts() {
-        let mut index = ShardedIndex::new(4);
+        let index = ShardedIndex::new(4);
         index.insert(&message("1", "alice", "invoice", "body"));
         index.insert(&message("2", "bob", "invoice", "body"));
         index.insert(&message("3", "carol", "other", "body"));

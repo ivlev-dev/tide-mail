@@ -8,6 +8,8 @@ pub const DEFAULT_FOLDERS: &[(&str, &str)] = &[
     ("Trash", "trash"),
     ("Archive", "archive"),
     ("Junk", "junk"),
+    ("Quarantine", "quarantine"),
+    ("Virus", "virus"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

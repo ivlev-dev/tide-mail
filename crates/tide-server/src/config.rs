@@ -18,6 +18,8 @@ pub struct Config {
     pub spam: SpamSettings,
     #[serde(default)]
     pub antivirus: AntivirusSettings,
+    #[serde(default)]
+    pub blob: BlobSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,10 +57,24 @@ pub struct ServerSettings {
     pub admin_token: Option<String>,
     #[serde(default)]
     pub backup_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub standby: bool,
+    #[serde(default = "default_standby_retry")]
+    pub standby_retry_secs: u64,
+    #[serde(default = "default_blob_gc_grace")]
+    pub blob_gc_grace_secs: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_standby_retry() -> u64 {
+    2
+}
+
+fn default_blob_gc_grace() -> u64 {
+    3600
 }
 
 fn default_snapshot_interval() -> u64 {
@@ -92,6 +108,9 @@ impl Default for ServerSettings {
             snapshot_interval_secs: 300,
             admin_token: None,
             backup_dir: None,
+            standby: false,
+            standby_retry_secs: default_standby_retry(),
+            blob_gc_grace_secs: default_blob_gc_grace(),
         }
     }
 }
@@ -143,9 +162,43 @@ pub struct AntivirusSettings {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
+    pub async_scan: bool,
+    #[serde(default)]
     pub clamav_addr: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
+    #[serde(default = "default_quarantine_folder")]
+    pub quarantine_folder: String,
+    #[serde(default = "default_infected_folder")]
+    pub infected_folder: String,
+}
+
+fn default_quarantine_folder() -> String {
+    "Quarantine".into()
+}
+
+fn default_infected_folder() -> String {
+    "Virus".into()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlobSettings {
+    #[serde(default)]
+    pub backend: String,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub allow_http: bool,
 }
 
 impl Default for SpamSettings {
@@ -293,6 +346,9 @@ dane = false
 snapshot_interval_secs = 300
 # admin_token = "change-me"
 # backup_dir = "./backups"
+blob_gc_grace_secs = 3600
+standby = false
+standby_retry_secs = 2
 
 [tls]
 # Оставьте пустым для самоподписанного сертификата.
@@ -305,8 +361,19 @@ enabled = false
 reject_spf_fail = false
 reject_dmarc_fail = false
 
+[blob]
+backend = "local"
+# bucket = "tide-mail"
+# region = "us-east-1"
+# endpoint = "https://s3.example.com"
+# access_key_id = "..."
+# secret_access_key = "..."
+# prefix = "blobs"
+# allow_http = false
+
 [antivirus]
 enabled = false
+async_scan = false
 # clamav_addr = "127.0.0.1:3310"
 # command = "clamdscan"
 

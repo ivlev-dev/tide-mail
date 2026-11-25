@@ -9,10 +9,11 @@ pub mod index;
 pub mod lane;
 
 pub use batch::{DecodedBatch, NewBatch, Record, Record as StoredRecord};
-pub use blob::BlobStore;
+pub use blob::{BlobStore, S3Config};
 pub use change::{ChangeEntry, ChangesPage, SyncCursor};
 pub use db::{AccountStats, Db, MailboxStats, StoreOptions, StoreStats};
 pub use error::StoreError;
 pub use folder::{DEFAULT_FOLDERS, Folder, FolderRecord, validate_folder_name};
+pub use index::ShardedIndex;
 pub use index::{SearchHit, SearchQuery};
 pub use lane::{Durability, Receipt};

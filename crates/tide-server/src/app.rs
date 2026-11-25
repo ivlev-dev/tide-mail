@@ -8,6 +8,7 @@ use tide_store::Db;
 use crate::auth::Registry;
 use crate::config::Config;
 use crate::outbound::OutboundQueue;
+use crate::scan_queue::ScanQueue;
 use crate::virus_scan::VirusScanner;
 
 pub struct App {
@@ -19,6 +20,7 @@ pub struct App {
     pub email_auth: Option<Arc<MessageAuthenticator>>,
     pub spam: Option<Arc<SpamEngine>>,
     pub antivirus: Option<Arc<VirusScanner>>,
+    pub scan_queue: Option<Arc<ScanQueue>>,
 }
 
 impl App {
@@ -32,6 +34,7 @@ impl App {
         email_auth: Option<Arc<MessageAuthenticator>>,
         spam: Option<Arc<SpamEngine>>,
         antivirus: Option<Arc<VirusScanner>>,
+        scan_queue: Option<Arc<ScanQueue>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
@@ -42,6 +45,7 @@ impl App {
             email_auth,
             spam,
             antivirus,
+            scan_queue,
         })
     }
 }
