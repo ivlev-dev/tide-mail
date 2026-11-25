@@ -21,6 +21,8 @@ crossbeam-channel = "0.5"
 futures = "0.3"
 futures-channel = "0.3"
 idna = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+psl = "2"
 io-uring = "0.7"
 libc = "0.2"
 mail-parser = { version = "1", features = ["full_encoding"] }

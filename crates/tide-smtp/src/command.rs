@@ -46,6 +46,10 @@ pub enum Command {
         size: u64,
         last: bool,
     },
+    Burl {
+        url: String,
+        last: bool,
+    },
     Rset,
     Noop,
     Quit,
@@ -69,6 +73,7 @@ impl Command {
             Self::Rcpt(_) => "RCPT",
             Self::Data => "DATA",
             Self::Bdat { .. } => "BDAT",
+            Self::Burl { .. } => "BURL",
             Self::Rset => "RSET",
             Self::Noop => "NOOP",
             Self::Quit => "QUIT",
@@ -139,6 +144,22 @@ pub fn parse_command(line: &[u8]) -> Result<Command, String> {
                 .map(|value| value.eq_ignore_ascii_case("LAST"))
                 .unwrap_or(false);
             Ok(Command::Bdat { size, last })
+        }
+        "BURL" => {
+            let mut parts = rest.split_whitespace();
+            let url = parts
+                .next()
+                .ok_or_else(|| "BURL требует URL".to_string())?
+                .to_string();
+            let last = match parts.next() {
+                Some(value) if value.eq_ignore_ascii_case("LAST") => true,
+                Some(_) => return Err("BURL поддерживает только LAST".into()),
+                None => false,
+            };
+            if parts.next().is_some() {
+                return Err("лишние аргументы BURL".into());
+            }
+            Ok(Command::Burl { url, last })
         }
         "RSET" => Ok(Command::Rset),
         "NOOP" => Ok(Command::Noop),
@@ -245,6 +266,17 @@ mod tests {
             Command::Auth {
                 mechanism: "PLAIN".into(),
                 initial: Some("AHRlc3QAcGFzcw==".into())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_burl() {
+        assert_eq!(
+            parse_command(b"BURL https://example.com/message LAST").unwrap(),
+            Command::Burl {
+                url: "https://example.com/message".into(),
+                last: true
             }
         );
     }

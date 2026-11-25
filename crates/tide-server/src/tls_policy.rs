@@ -191,7 +191,7 @@ pub fn dane_matches(records: &[DaneRecord], certificate: &[u8]) -> bool {
 }
 
 pub fn dane_chain_matches(records: &[DaneRecord], certificates: &[&[u8]]) -> bool {
-    use sha2::{Digest, Sha256};
+    use sha2::{Digest, Sha256, Sha512};
     use x509_parser::parse_x509_certificate;
     for record in records {
         if !matches!(record.usage, 2 | 3) {
@@ -214,6 +214,7 @@ pub fn dane_chain_matches(records: &[DaneRecord], certificates: &[&[u8]]) -> boo
             let matches = match record.matching {
                 0 => material == record.data.as_slice(),
                 1 => Sha256::digest(material).as_slice() == record.data.as_slice(),
+                2 => Sha512::digest(material).as_slice() == record.data.as_slice(),
                 _ => false,
             };
             if matches {
@@ -307,7 +308,7 @@ pub fn client_config(records: &[DaneRecord]) -> Result<rustls::ClientConfig, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use sha2::{Digest, Sha256, Sha512};
 
     #[test]
     fn matches_wildcard_mx() {
@@ -337,5 +338,19 @@ mod tests {
             }],
             &der
         ));
+    }
+
+    #[test]
+    fn checks_dane_sha512_and_ta() {
+        let cert = rcgen::generate_simple_self_signed(vec!["mail.example.com".into()]).unwrap();
+        let der = cert.cert.der().to_vec();
+        let digest = Sha512::digest(&der).to_vec();
+        let records = vec![DaneRecord {
+            usage: 2,
+            selector: 0,
+            matching: 2,
+            data: digest,
+        }];
+        assert!(dane_matches(&records, &der));
     }
 }

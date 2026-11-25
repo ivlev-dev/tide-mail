@@ -38,6 +38,10 @@ pub struct SmtpConfig {
     pub enable_binarymime: bool,
     pub enable_dsn: bool,
     pub enable_require_tls: bool,
+    pub enable_future_release: bool,
+    pub max_future_release_secs: u64,
+    pub enable_deliver_by: bool,
+    pub enable_burl: bool,
     pub max_hops: usize,
     pub auth_mechanisms: Vec<AuthMechanism>,
 }
@@ -60,6 +64,10 @@ impl Default for SmtpConfig {
             enable_binarymime: true,
             enable_dsn: true,
             enable_require_tls: true,
+            enable_future_release: false,
+            max_future_release_secs: 2_592_000,
+            enable_deliver_by: true,
+            enable_burl: false,
             max_hops: 50,
             auth_mechanisms: vec![AuthMechanism::Plain, AuthMechanism::Login],
         }
@@ -71,6 +79,8 @@ impl SmtpConfig {
         Self {
             hostname: hostname.into(),
             require_auth: true,
+            enable_future_release: true,
+            enable_burl: true,
             ..Self::default()
         }
     }

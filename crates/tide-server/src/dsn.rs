@@ -7,8 +7,55 @@ pub fn is_dsn(raw: &[u8]) -> bool {
     head.contains("multipart/report") && head.contains("report-type=delivery-status")
 }
 
+#[allow(dead_code)]
 pub fn build_failure_dsn(job: &OutboundJob, hostname: &str, reason: &str) -> Vec<u8> {
+    build_failure_dsn_with_status(job, hostname, reason, "5.0.0")
+}
+
+pub fn build_failure_dsn_with_status(
+    job: &OutboundJob,
+    hostname: &str,
+    reason: &str,
+    status: &str,
+) -> Vec<u8> {
+    build_delivery_dsn(
+        job,
+        hostname,
+        reason,
+        status,
+        "Failure",
+        "failed permanently",
+        "failed",
+    )
+}
+
+pub fn build_delayed_dsn(job: &OutboundJob, hostname: &str) -> Vec<u8> {
+    build_delivery_dsn(
+        job,
+        hostname,
+        "delivery time expired",
+        "4.4.7",
+        "Delay",
+        "delayed",
+        "delayed",
+    )
+}
+
+fn build_delivery_dsn(
+    job: &OutboundJob,
+    hostname: &str,
+    reason: &str,
+    status: &str,
+    subject: &str,
+    explanation: &str,
+    action: &str,
+) -> Vec<u8> {
     let now = now_millis() / 1000;
+    let arrived = if job.created_at > 0 {
+        job.created_at
+    } else {
+        now
+    };
     let date = mail_parser::DateTime::from_timestamp(now).to_rfc822();
     let boundary = format!("----tide-dsn-{}", now);
     let message_id = if job.message_id.is_empty() {
@@ -21,7 +68,7 @@ pub fn build_failure_dsn(job: &OutboundJob, hostname: &str, reason: &str) -> Vec
         format!(
             "From: Mail Delivery System <MAILER-DAEMON@{hostname}>\r\n\
              To: <{}>\r\n\
-             Subject: Delivery Status Notification (Failure)\r\n\
+             Subject: Delivery Status Notification ({subject})\r\n\
              Date: {date}\r\n\
              Message-ID: <dsn-{}@tide>\r\n\
              Auto-Submitted: auto-replied\r\n\
@@ -38,7 +85,7 @@ pub fn build_failure_dsn(job: &OutboundJob, hostname: &str, reason: &str) -> Vec
     out.extend_from_slice(
         format!(
             "This is the mail system at {hostname}.\n\n\
-             Delivery to the following recipient failed permanently:\n\n    {}\n\n\
+             Delivery to the following recipient {explanation}:\n\n    {}\n\n\
              Reason: {reason}\n\n\
              The original message headers are attached.\n",
             job.to
@@ -51,15 +98,18 @@ pub fn build_failure_dsn(job: &OutboundJob, hostname: &str, reason: &str) -> Vec
     out.extend_from_slice(
         format!(
             "Reporting-MTA: dns; {hostname}\r\n\
-             X-Tide-Queue-ID: {}\r\n\r\n\
+             X-Tide-Queue-ID: {}\r\n\
+             Arrival-Date: {}\r\n{}\
              Final-Recipient: rfc822; {}\r\n\
              {}\
-             Action: failed\r\n\
-             Status: 5.0.0\r\n\
+             Action: {action}\r\n\
+             Status: {status}\r\n\
              Diagnostic-Code: smtp; {reason}\r\n\
              Original-Message-ID: {message_id}\r\n{}\
              ",
             job.id,
+            mail_parser::DateTime::from_timestamp(arrived).to_rfc822(),
+            dsn_dates(job),
             job.to,
             job.orcpt
                 .as_ref()
@@ -92,6 +142,40 @@ pub fn build_failure_dsn(job: &OutboundJob, hostname: &str, reason: &str) -> Vec
         out.extend_from_slice(format!("\r\n\r\n--{boundary}--\r\n").as_bytes());
     }
     out
+}
+
+fn dsn_dates(job: &OutboundJob) -> String {
+    let mut fields = String::new();
+    if let Some(deadline) = deliver_by_deadline(job) {
+        let date = mail_parser::DateTime::from_timestamp(deadline).to_rfc822();
+        fields.push_str(&format!("Deliver-By-Date: {date}\r\n"));
+    }
+    if let Some(release) = &job.future_release {
+        let value = if let Some(seconds) = release.strip_prefix("for;") {
+            format!("for;{seconds}")
+        } else if let Some(epoch) = release.strip_prefix("until;") {
+            let timestamp = epoch.parse::<i64>().unwrap_or(0);
+            let date = chrono::DateTime::from_timestamp(timestamp, 0)
+                .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_else(|| epoch.to_string());
+            format!("until;{date}")
+        } else {
+            release.clone()
+        };
+        fields.push_str(&format!("Future-Release-Request: {value}\r\n"));
+    }
+    fields
+}
+
+fn deliver_by_deadline(job: &OutboundJob) -> Option<i64> {
+    let seconds = job
+        .deliver_by
+        .as_deref()?
+        .split(';')
+        .next()?
+        .parse::<i64>()
+        .ok()?;
+    Some(job.created_at.max(0).saturating_add(seconds))
 }
 
 pub fn build_success_dsn(job: &OutboundJob, hostname: &str) -> Vec<u8> {

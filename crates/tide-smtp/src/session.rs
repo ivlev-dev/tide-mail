@@ -1,6 +1,8 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+
 use crate::address::validate_address;
 use crate::command::{Command, parse_command};
 use crate::config::{AuthMechanism, SmtpConfig};
@@ -65,6 +67,10 @@ pub enum Action {
     },
     ReadBdat {
         size: usize,
+        last: bool,
+    },
+    FetchBurl {
+        url: String,
         last: bool,
     },
     Deliver {
@@ -184,6 +190,27 @@ impl SmtpSession {
         }
     }
 
+    pub fn feed_burl_chunk(&mut self, chunk: &[u8], last: bool) -> Vec<Action> {
+        if self.data.len() + chunk.len() > self.config.max_message_size {
+            self.data.clear();
+            self.bdat_active = false;
+            return vec![Action::Reply(Reply::new(
+                552,
+                "5.3.4 Message size exceeds fixed maximum",
+            ))];
+        }
+        self.data.extend_from_slice(chunk);
+        if last {
+            self.bdat_active = false;
+            self.finish_data()
+        } else {
+            vec![Action::Reply(Reply::new(
+                250,
+                "2.5.0 Waiting for additional BURL or BDAT commands",
+            ))]
+        }
+    }
+
     pub fn tls_established(&mut self) {
         self.tls_active = true;
         self.helo = None;
@@ -283,13 +310,46 @@ impl SmtpSession {
                 }
                 let envid = mail.param("ENVID").map(str::to_string);
                 let require_tls = mail.has_param("REQUIRETLS");
-                let future_release = mail.param("FUTURERELEASE").map(str::to_string);
-                let deliver_by = mail.param("DELIVERBY").map(str::to_string);
-                if mail.has_param("BURL") {
+                let now = now_secs();
+                let hold_for = mail.param("HOLDFOR");
+                let hold_until = mail.param("HOLDUNTIL");
+                if mail.has_param("FUTURERELEASE") {
                     return vec![Action::Reply(Reply::new(
-                        504,
-                        "5.5.4 BURL is not supported",
+                        501,
+                        "5.5.4 Use HOLDFOR or HOLDUNTIL",
                     ))];
+                }
+                if hold_for.is_some() && hold_until.is_some() {
+                    return vec![Action::Reply(Reply::new(
+                        501,
+                        "5.5.4 Only one hold parameter is allowed",
+                    ))];
+                }
+                let future_release = match (hold_for, hold_until) {
+                    (Some(value), _) => match parse_hold_for(value, &self.config) {
+                        Ok(value) => Some(value),
+                        Err(reply) => return vec![Action::Reply(reply)],
+                    },
+                    (_, Some(value)) => match parse_hold_until(value, &self.config, now) {
+                        Ok(value) => Some(value),
+                        Err(reply) => return vec![Action::Reply(reply)],
+                    },
+                    _ => None,
+                };
+                let deliver_by = match parse_deliver_by(mail.param("BY"), &self.config) {
+                    Ok(value) => value,
+                    Err(reply) => return vec![Action::Reply(reply)],
+                };
+                if let (Some(release), Some(by)) = (
+                    future_release.as_deref().and_then(release_epoch),
+                    deliver_by.as_deref().and_then(deliver_by_epoch),
+                ) {
+                    if release > by {
+                        return vec![Action::Reply(Reply::new(
+                            501,
+                            "5.5.4 Future release is later than delivery deadline",
+                        ))];
+                    }
                 }
                 if require_tls && !self.config.enable_require_tls {
                     return vec![Action::Reply(Reply::new(
@@ -375,6 +435,25 @@ impl SmtpSession {
                 });
                 vec![Action::Reply(Reply::new(250, "2.1.5 Recipient accepted"))]
             }
+            Command::Burl { url, last } => {
+                if !self.config.enable_burl {
+                    return vec![Action::Reply(Reply::new(
+                        504,
+                        "5.5.4 BURL is not supported",
+                    ))];
+                }
+                let Some(envelope) = &self.envelope else {
+                    return vec![Action::Reply(Reply::new(503, "5.5.1 Send MAIL first"))];
+                };
+                if envelope.to.is_empty() {
+                    return vec![Action::Reply(Reply::new(503, "5.5.1 Send RCPT first"))];
+                }
+                if !self.bdat_active {
+                    self.data.clear();
+                    self.bdat_active = true;
+                }
+                vec![Action::FetchBurl { url, last }]
+            }
             Command::Bdat { size, last } => {
                 if !self.config.enable_chunking {
                     return vec![Action::Reply(Reply::new(
@@ -414,6 +493,12 @@ impl SmtpSession {
                     return vec![Action::Reply(Reply::new(
                         503,
                         "5.5.1 BINARYMIME requires BDAT",
+                    ))];
+                }
+                if self.bdat_active {
+                    return vec![Action::Reply(Reply::new(
+                        503,
+                        "5.5.1 DATA is not allowed after BURL or BDAT",
                     ))];
                 }
                 self.state = State::Data;
@@ -517,8 +602,21 @@ impl SmtpSession {
         if self.config.enable_require_tls {
             lines.push("REQUIRETLS".into());
         }
-        lines.push("FUTURERELEASE".into());
-        lines.push("DELIVERBY".into());
+        if self.config.enable_future_release {
+            let now = Utc::now();
+            let max = self.config.max_future_release_secs as i64;
+            let limit = (now + Duration::seconds(max)).to_rfc3339_opts(SecondsFormat::Secs, true);
+            lines.push(format!(
+                "FUTURERELEASE {} {}",
+                self.config.max_future_release_secs, limit
+            ));
+        }
+        if self.config.enable_deliver_by {
+            lines.push("DELIVERBY".into());
+        }
+        if self.config.enable_burl {
+            lines.push("BURL https".into());
+        }
         if self.config.enable_starttls && !self.tls_active {
             lines.push("STARTTLS".into());
         }
@@ -733,9 +831,97 @@ fn decode_plain(value: &str) -> Option<(String, String)> {
     ))
 }
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn parse_hold_for(value: &str, config: &SmtpConfig) -> Result<String, Reply> {
+    if !config.enable_future_release {
+        return Err(Reply::new(504, "5.5.4 FUTURERELEASE is not supported"));
+    }
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| Reply::new(501, "5.5.4 Invalid HOLDFOR value"))?;
+    if seconds == 0 || seconds > config.max_future_release_secs {
+        return Err(Reply::new(501, "5.5.4 HOLDFOR is out of range"));
+    }
+    Ok(format!("for;{seconds}"))
+}
+
+fn parse_hold_until(value: &str, config: &SmtpConfig, now: i64) -> Result<String, Reply> {
+    if !config.enable_future_release {
+        return Err(Reply::new(504, "5.5.4 FUTURERELEASE is not supported"));
+    }
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| Reply::new(501, "5.5.4 Invalid HOLDUNTIL date-time"))?;
+    let timestamp = parsed.timestamp();
+    if timestamp <= now || timestamp > now + config.max_future_release_secs as i64 {
+        return Err(Reply::new(501, "5.5.4 HOLDUNTIL is out of range"));
+    }
+    Ok(format!("until;{timestamp}"))
+}
+
+fn parse_deliver_by(value: Option<&str>, config: &SmtpConfig) -> Result<Option<String>, Reply> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !config.enable_deliver_by {
+        return Err(Reply::new(504, "5.5.4 DELIVERBY is not supported"));
+    }
+    let mut parts = value.split(';');
+    let time = parts
+        .next()
+        .and_then(|token| token.parse::<i64>().ok())
+        .ok_or_else(|| Reply::new(501, "5.5.4 Invalid BY value"))?;
+    let mode = parts
+        .next()
+        .map(str::to_ascii_uppercase)
+        .ok_or_else(|| Reply::new(501, "5.5.4 BY requires a mode"))?;
+    if !matches!(mode.as_str(), "R" | "N") {
+        return Err(Reply::new(501, "5.5.4 Invalid BY mode"));
+    }
+    if mode == "R" && time <= 0 {
+        return Err(Reply::new(501, "5.5.4 BY mode R requires positive time"));
+    }
+    if let Some(trace) = parts.next() {
+        if !trace.eq_ignore_ascii_case("T") {
+            return Err(Reply::new(501, "5.5.4 Invalid BY trace option"));
+        }
+    }
+    Ok(Some(format!("{time};{mode}")))
+}
+
+fn release_epoch(value: &str) -> Option<i64> {
+    if let Some(seconds) = value.strip_prefix("for;") {
+        let seconds = seconds.parse::<i64>().ok()?;
+        return Some(now_secs().saturating_add(seconds));
+    }
+    value
+        .strip_prefix("until;")
+        .and_then(|epoch| epoch.parse::<i64>().ok())
+}
+
+fn deliver_by_epoch(value: &str) -> Option<i64> {
+    let time = value.split(';').next()?.parse::<i64>().ok()?;
+    Some(now_secs().saturating_add(time))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn submission_session() -> SmtpSession {
+        SmtpSession::new(SmtpConfig {
+            enable_future_release: true,
+            enable_burl: true,
+            require_auth: false,
+            ..SmtpConfig::default()
+        })
+        .0
+    }
 
     fn session() -> SmtpSession {
         SmtpSession::new(SmtpConfig {
@@ -806,7 +992,6 @@ mod tests {
             "REQUIRETLS",
             "SMTPUTF8",
             "BINARYMIME",
-            "FUTURERELEASE",
             "DELIVERBY",
         ] {
             assert!(
@@ -838,28 +1023,71 @@ mod tests {
     }
 
     #[test]
-    fn rejects_burl() {
-        let mut session = session();
+    fn burl_requires_recipient_and_is_fetched() {
+        let mut session = submission_session();
         session.feed_line(b"EHLO client");
-        let actions =
-            session.feed_line(b"MAIL FROM:<a@example.com> BURL=https://example.com/message");
-        assert_eq!(replies(&actions)[0].code, 504);
+        let actions = session.feed_line(b"BURL https://example.com/message LAST");
+        assert_eq!(replies(&actions)[0].code, 503);
+        session.feed_line(b"MAIL FROM:<a@example.com>");
+        session.feed_line(b"RCPT TO:<b@example.com>");
+        let actions = session.feed_line(b"BURL https://example.com/message LAST");
+        assert_eq!(
+            actions[0],
+            Action::FetchBurl {
+                url: "https://example.com/message".into(),
+                last: true
+            }
+        );
+        let actions = session.feed_burl_chunk(b"hello", true);
+        assert!(matches!(actions[0], Action::Deliver { .. }));
+    }
+
+    #[test]
+    fn submission_advertises_future_release() {
+        let mut session = submission_session();
+        let actions = session.feed_line(b"EHLO client");
+        let reply = &replies(&actions)[0];
+        assert!(
+            reply
+                .lines
+                .iter()
+                .any(|line| line.starts_with("FUTURERELEASE 2592000 "))
+        );
     }
 
     #[test]
     fn parses_release_and_deadline() {
-        let mut session = session();
+        let mut session = submission_session();
         session.feed_line(b"EHLO client");
         assert_eq!(
-            replies(
-                &session.feed_line(b"MAIL FROM:<a@example.com> FUTURERELEASE=3600 DELIVERBY=86400")
-            )[0]
-            .code,
+            replies(&session.feed_line(b"MAIL FROM:<a@example.com> HOLDFOR=3600 BY=86400;R"))[0]
+                .code,
             250
         );
         let envelope = session.envelope.as_ref().unwrap();
-        assert_eq!(envelope.future_release.as_deref(), Some("3600"));
-        assert_eq!(envelope.deliver_by.as_deref(), Some("86400"));
+        assert_eq!(envelope.future_release.as_deref(), Some("for;3600"));
+        assert_eq!(envelope.deliver_by.as_deref(), Some("86400;R"));
+    }
+
+    #[test]
+    fn rejects_invalid_release_and_deadline() {
+        let mut session = submission_session();
+        session.feed_line(b"EHLO client");
+        assert_eq!(
+            replies(&session.feed_line(b"MAIL FROM:<a@example.com> BY=0;R"))[0].code,
+            501
+        );
+        assert_eq!(
+            replies(&session.feed_line(
+                b"MAIL FROM:<a@example.com> HOLDFOR=3600 HOLDUNTIL=2030-01-01T00:00:00Z"
+            ))[0]
+                .code,
+            501
+        );
+        assert_eq!(
+            replies(&session.feed_line(b"MAIL FROM:<a@example.com> HOLDFOR=999999999"))[0].code,
+            501
+        );
     }
 
     #[test]

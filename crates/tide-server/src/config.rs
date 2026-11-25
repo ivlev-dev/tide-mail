@@ -145,6 +145,14 @@ pub struct DkimSettings {
     pub selector: String,
     #[serde(default)]
     pub private_key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub arc: bool,
+    #[serde(default)]
+    pub arc_selector: String,
+    #[serde(default)]
+    pub dkim2: bool,
+    #[serde(default)]
+    pub dkim2_selector: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,6 +413,10 @@ reject_threshold = 15.0
 # domain = "mail.local"
 # selector = "default"
 # private_key_path = "./certs/dkim.key"
+# arc = true
+# arc_selector = "arc"
+# dkim2 = true
+# dkim2_selector = "dkim2"
 
 [[accounts]]
 email = "alice@mail.local"

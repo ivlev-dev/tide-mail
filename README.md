@@ -76,6 +76,10 @@ reject_threshold = 15.0
 # domain = "mail.local"
 # selector = "default"
 # private_key_path = "./certs/dkim.key"
+# arc = true
+# arc_selector = "arc"
+# dkim2 = true
+# dkim2_selector = "dkim2"
 
 [[accounts]]
 email = "alice@mail.local"
@@ -94,10 +98,10 @@ docker compose up --build
 ## SMTP
 
 - Порты 25/465/587 (в примере 2525/4650/5870), LMTP, implicit TLS, STARTTLS, AUTH PLAIN/LOGIN.
-- ESMTP: SIZE, 8BITMIME, SMTPUTF8, PIPELINING, CHUNKING/BDAT, BINARYMIME, DSN, REQUIRETLS, FUTURERELEASE, DELIVERBY.
-- Trace-заголовки, IDNA, address literals, отклонение BURL.
-- Входящие SPF/DKIM/DMARC/ARC/DKIM2, исходящие DKIM + opportunistic TLS + MTA-STS + DANE.
-- DMARC aggregate/failure reports и TLS-RPT через outbound-очередь.
+- ESMTP: SIZE, 8BITMIME, SMTPUTF8, PIPELINING, CHUNKING/BDAT, BINARYMIME, DSN, REQUIRETLS, FUTURERELEASE, DELIVERBY, BURL (HTTPS).
+- Trace-заголовки, IDNA, address literals, SSRF-защита BURL.
+- Входящие SPF/DKIM/DMARC/ARC/DKIM2, исходящие DKIM/ARC/DKIM2 + opportunistic TLS + MTA-STS + DANE.
+- DMARC aggregate/failure reports с `pct` и external destination verification, TLS-RPT с успешными и неуспешными сессиями.
 - Входящие письма маршрутизируются локальным аккаунтам, парсятся и индексируются.
 - Submission с внешними получателями ставит письма в outbound-очередь (если `outbound_enabled`).
 

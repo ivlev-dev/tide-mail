@@ -24,6 +24,14 @@ struct DmarcEvent {
     policy: String,
     adkim: String,
     aspf: String,
+    #[serde(default = "default_pct")]
+    pct: u8,
+    #[serde(default)]
+    sampled_out: bool,
+}
+
+fn default_pct() -> u8 {
+    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +43,8 @@ struct TlsEvent {
     result_type: String,
     sending_mta: String,
     receiving_mta: String,
+    #[serde(default)]
+    success: bool,
 }
 
 pub struct Reports {
@@ -74,6 +84,8 @@ impl Reports {
         policy: &str,
         adkim: &str,
         aspf: &str,
+        pct: u8,
+        sampled_out: bool,
     ) {
         if !self.dmarc_enabled || rua.is_empty() {
             return;
@@ -90,6 +102,8 @@ impl Reports {
             policy: policy.to_string(),
             adkim: adkim.to_string(),
             aspf: aspf.to_string(),
+            pct,
+            sampled_out,
         };
         let _ = append_json(&self.dir.join("dmarc.jsonl"), &event);
     }
@@ -114,6 +128,31 @@ impl Reports {
             result_type: result_type.to_string(),
             sending_mta: sending_mta.to_string(),
             receiving_mta: receiving_mta.to_string(),
+            success: false,
+        };
+        let _ = append_json(&self.dir.join("tlsrpt.jsonl"), &event);
+    }
+
+    pub fn record_tls_success(
+        &self,
+        domain: &str,
+        rua: &[String],
+        policy_type: &str,
+        sending_mta: &str,
+        receiving_mta: &str,
+    ) {
+        if !self.tls_enabled || rua.is_empty() {
+            return;
+        }
+        let event = TlsEvent {
+            ts: crate::auth::now_millis() / 1000,
+            domain: domain.to_string(),
+            rua: rua.to_vec(),
+            policy_type: policy_type.to_string(),
+            result_type: String::new(),
+            sending_mta: sending_mta.to_string(),
+            receiving_mta: receiving_mta.to_string(),
+            success: true,
         };
         let _ = append_json(&self.dir.join("tlsrpt.jsonl"), &event);
     }
@@ -349,9 +388,10 @@ fn build_dmarc_xml(hostname: &str, domain: &str, records: &[DmarcEvent]) -> Vec<
         first.map(|record| record.aspf.as_str()).unwrap_or("r")
     ));
     xml.push_str(&format!(
-        "    <p>{}</p>\n    <sp>{}</sp>\n    <pct>100</pct>\n",
+        "    <p>{}</p>\n    <sp>{}</sp>\n    <pct>{}</pct>\n",
         first.map(|record| record.policy.as_str()).unwrap_or("none"),
-        first.map(|record| record.policy.as_str()).unwrap_or("none")
+        first.map(|record| record.policy.as_str()).unwrap_or("none"),
+        first.map(|record| record.pct).unwrap_or(100)
     ));
     xml.push_str("  </policy_published>\n");
     for record in records {
@@ -367,7 +407,11 @@ fn build_dmarc_xml(hostname: &str, domain: &str, records: &[DmarcEvent]) -> Vec<
             escape(&record.dkim),
             escape(&record.spf)
         ));
-        xml.push_str("      </policy_evaluated>\n    </row>\n    <identifiers>\n");
+        xml.push_str("      </policy_evaluated>\n");
+        if record.sampled_out {
+            xml.push_str("      <reason><type>sampled_out</type></reason>\n");
+        }
+        xml.push_str("    </row>\n    <identifiers>\n");
         xml.push_str(&format!(
             "      <header_from>{}</header_from>\n    </identifiers>\n",
             escape(&record.header_from)
@@ -396,8 +440,10 @@ fn build_tlsrpt_json(hostname: &str, domain: &str, records: &[TlsEvent]) -> Vec<
         .first()
         .map(|record| record.policy_type.as_str())
         .unwrap_or("smtp-tls");
+    let successes = records.iter().filter(|record| record.success).count();
     let failures = records
         .iter()
+        .filter(|record| !record.success)
         .map(|record| {
             json!({
                 "result-type": record.result_type,
@@ -422,8 +468,8 @@ fn build_tlsrpt_json(hostname: &str, domain: &str, records: &[TlsEvent]) -> Vec<
                 "domain": domain
             },
             "summary": {
-                "total-successful-session-count": 0,
-                "total-failure-session-count": records.len()
+                "total-successful-session-count": successes,
+                "total-failure-session-count": records.len() - successes
             },
             "failure-details": failures
         }]
@@ -460,6 +506,8 @@ mod tests {
             policy: "none".into(),
             adkim: "r".into(),
             aspf: "r".into(),
+            pct: 100,
+            sampled_out: false,
         }
     }
 
@@ -485,6 +533,7 @@ mod tests {
                 result_type: "certificate-expired".into(),
                 sending_mta: "192.0.2.1".into(),
                 receiving_mta: "192.0.2.2".into(),
+                success: false,
             }],
         );
         let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
@@ -493,6 +542,56 @@ mod tests {
             value["policies"][0]["failure-details"][0]["failed-session-count"],
             1
         );
+    }
+
+    #[test]
+    fn counts_successful_tls_sessions() {
+        let raw = build_tlsrpt_json(
+            "mail.local",
+            "example.com",
+            &[
+                TlsEvent {
+                    ts: 100,
+                    domain: "example.com".into(),
+                    rua: vec!["tls@example.com".into()],
+                    policy_type: "sts".into(),
+                    result_type: String::new(),
+                    sending_mta: "192.0.2.1".into(),
+                    receiving_mta: "192.0.2.2".into(),
+                    success: true,
+                },
+                TlsEvent {
+                    ts: 101,
+                    domain: "example.com".into(),
+                    rua: vec!["tls@example.com".into()],
+                    policy_type: "sts".into(),
+                    result_type: "tls-connection-failure".into(),
+                    sending_mta: "192.0.2.1".into(),
+                    receiving_mta: "192.0.2.3".into(),
+                    success: false,
+                },
+            ],
+        );
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            value["policies"][0]["summary"]["total-successful-session-count"],
+            1
+        );
+        assert_eq!(
+            value["policies"][0]["summary"]["total-failure-session-count"],
+            1
+        );
+    }
+
+    #[test]
+    fn marks_sampled_out_records() {
+        let mut event = event();
+        event.sampled_out = true;
+        event.disposition = "quarantine".into();
+        let xml =
+            String::from_utf8(build_dmarc_xml("mail.local", "example.com", &[event])).unwrap();
+        assert!(xml.contains("<type>sampled_out</type>"));
+        assert_eq!(xml.matches("<pct>").count(), 1);
     }
 
     #[test]

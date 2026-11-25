@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::net::IpAddr;
+use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::Arc;
 
 use monoio::net::{TcpListener, TcpStream};
@@ -111,6 +112,24 @@ async fn handle_connection(
                     };
                     conn.write_all(&reply.to_wire()).await?;
                 }
+                Action::FetchBurl { url, last } => {
+                    let limit = 64 * 1024 * 1024;
+                    let result = monoio::spawn_blocking(move || fetch_burl(&url, limit)).await;
+                    match result {
+                        Ok(Ok(chunk)) => {
+                            actions.extend(session.feed_burl_chunk(&chunk, last));
+                        }
+                        Ok(Err((code, message))) => {
+                            let reply = tide_smtp::Reply::new(code, message);
+                            conn.write_all(&reply.to_wire()).await?;
+                        }
+                        Err(_) => {
+                            let reply =
+                                tide_smtp::Reply::new(451, "4.4.1 BURL fetch was cancelled");
+                            conn.write_all(&reply.to_wire()).await?;
+                        }
+                    }
+                }
                 Action::ReadBdat { size, last } => {
                     let chunk = conn.read_exact(size, 64 * 1024 * 1024).await?;
                     actions.extend(session.feed_bdat_chunk(&chunk, last));
@@ -170,6 +189,96 @@ fn add_trace_headers(
     out
 }
 
+fn fetch_burl(url: &str, limit: usize) -> Result<Vec<u8>, (u16, String)> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|_| (554, "5.7.1 Invalid BURL URL".to_string()))?;
+    if parsed.scheme() != "https" {
+        return Err((554, "5.7.1 BURL requires https".to_string()));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err((554, "5.7.1 BURL credentials are not allowed".to_string()));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| (554, "5.7.1 BURL has no host".to_string()))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| (451, "4.4.1 BURL host cannot be resolved".to_string()))?;
+    let mut resolved = false;
+    for address in addresses {
+        resolved = true;
+        if blocked_ip(address.ip()) {
+            return Err((554, "5.7.1 BURL points to a private address".to_string()));
+        }
+    }
+    if !resolved {
+        return Err((451, "4.4.1 BURL host cannot be resolved".to_string()));
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .build()
+        .map_err(|error| (451, format!("4.4.1 BURL client: {error}")))?;
+    let response = client
+        .get(parsed)
+        .send()
+        .map_err(|error| (451, format!("4.4.1 BURL fetch failed: {error}")))?;
+    if !response.status().is_success() {
+        return Err((554, format!("5.6.6 BURL returned {}", response.status())));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err((554, "5.3.4 BURL content is too large".to_string()));
+    }
+    let mut body = Vec::new();
+    response
+        .take(limit as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| (451, format!("4.4.1 BURL read failed: {error}")))?;
+    if body.len() > limit {
+        return Err((554, "5.3.4 BURL content is too large".to_string()));
+    }
+    Ok(body)
+}
+
+fn blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => blocked_ipv4(ip),
+        IpAddr::V6(ip) => blocked_ipv6(ip),
+    }
+}
+
+fn blocked_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..128).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 198 && (18..20).contains(&octets[1]))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+}
+
+fn blocked_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return blocked_ipv4(mapped);
+    }
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+}
+
 async fn deliver_lmtp(
     app: &App,
     submission: bool,
@@ -204,6 +313,7 @@ async fn deliver(
     let mut spf_fail = false;
     let mut dkim_fail = false;
     let mut dmarc_fail = false;
+    let mut dmarc_quarantine = false;
     if !submission && app.config.email_auth.enabled {
         if let Some(authenticator) = app.email_auth.clone() {
             let hostname = app.config.server.hostname.clone();
@@ -227,6 +337,10 @@ async fn deliver(
                     spf_fail = verification.spf_fail;
                     dkim_fail = verification.dkim_fail;
                     dmarc_fail = verification.dmarc_fail;
+                    dmarc_quarantine = verification
+                        .dmarc
+                        .as_ref()
+                        .is_some_and(|info| info.disposition == "quarantine");
                     if app.config.email_auth.reject_spf_fail && verification.spf_fail {
                         return tide_smtp::Reply::new(550, "5.7.23 SPF policy rejection");
                     }
@@ -247,6 +361,8 @@ async fn deliver(
                             &info.policy,
                             &info.adkim,
                             &info.aspf,
+                            info.pct,
+                            info.sampled_out,
                         );
                         if info.disposition != "none" && !info.ruf.is_empty() {
                             if let Some(outbound) = app.outbound.as_ref() {
@@ -302,7 +418,7 @@ async fn deliver(
         augmented.extend_from_slice(&data);
         data = augmented;
     }
-    let mut spam = false;
+    let mut spam = dmarc_quarantine;
     if !submission {
         if let Some(engine) = app.spam.clone() {
             let raw = data.clone();
@@ -321,8 +437,8 @@ async fn deliver(
                     if verdict.reject {
                         return tide_smtp::Reply::new(550, "5.7.1 Message rejected as spam");
                     }
-                    spam = is_spam;
-                    let status = if is_spam { "Yes" } else { "No" };
+                    spam = spam || is_spam;
+                    let status = if spam { "Yes" } else { "No" };
                     let mut header = format!(
                         "X-Spam-Score: {:.1}\r\nX-Spam-Status: {status}\r\n",
                         verdict.score
@@ -430,4 +546,26 @@ async fn deliver(
         }
     }
     SmtpSession::message_accepted()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_private_burl_targets() {
+        assert!(blocked_ip("127.0.0.1".parse().unwrap()));
+        assert!(blocked_ip("10.1.2.3".parse().unwrap()));
+        assert!(blocked_ip("169.254.169.254".parse().unwrap()));
+        assert!(blocked_ip("::1".parse().unwrap()));
+        assert!(blocked_ip("fc00::1".parse().unwrap()));
+        assert!(!blocked_ip("93.184.216.34".parse().unwrap()));
+        assert!(!blocked_ip("2606:2800:220:1::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_non_https_burl() {
+        assert!(fetch_burl("http://example.com/message", 1024).is_err());
+        assert!(fetch_burl("file:///etc/passwd", 1024).is_err());
+    }
 }

@@ -23,7 +23,7 @@
 - `CHUNKING` / `BDAT`
 - `BINARYMIME` (только через `BDAT`)
 - `DSN`: `RET`, `ENVID`, `NOTIFY`, `ORCPT`
-- `REQUIRETLS`, `FUTURERELEASE`, `DELIVERBY`
+- `REQUIRETLS`, `FUTURERELEASE` (`HOLDFOR`/`HOLDUNTIL`), `DELIVERBY` (`BY=<секунды>;<R|N>`)
 - IDNA-домены и IPv4/IPv6 address literals
 - `STARTTLS`
 - `AUTH PLAIN`, `AUTH LOGIN`, cancel через `*`
@@ -31,7 +31,7 @@
 - enhanced status codes
 - trace-заголовки `Received`, `Return-Path`, `Delivered-To`, loop limit
 - `LHLO` и per-recipient ответы в режиме LMTP
-- `BURL` явно отклоняется с `504`
+- `BURL <https-url> [LAST]` на submission с защитой от SSRF
 
 ## LMTP
 
@@ -43,9 +43,11 @@
 - Параметры передаются следующему MTA в outbound-транзакции.
 - `RET=FULL` включает полное исходное письмо в failure DSN, иначе только заголовки.
 - `NOTIFY=SUCCESS` включает success DSN, `NOTIFY=NEVER` подавляет отчёты, `NOTIFY=FAILURE` включает только failure.
-- `FUTURERELEASE=<секунды>` удерживает письмо в очереди до указанного времени.
-- `DELIVERBY=<секунды>` задаёт дедлайн; после его истечения формируется failure DSN.
+- `HOLDFOR=<секунды>` удерживает письмо в очереди до указанного времени.
+- `HOLDUNTIL=<RFC 3339 UTC>` задаёт абсолютное время выпуска.
+- `BY=<секунды>;R` задаёт дедлайн с failure DSN `5.4.7`; `BY=<секунды>;N` шлёт delayed DSN `4.4.7` и продолжает попытки.
 - `REQUIRETLS` требует TLS при outbound-доставке.
+- `BURL https://... LAST` заменяет `DATA`; сервер скачивает тело по HTTPS и применяет обычные проверки.
 
 Ограничения: размер сообщения, число получателей, длина строки, таймауты соединения (на уровне транспорта).
 

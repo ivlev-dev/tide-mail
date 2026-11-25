@@ -140,6 +140,24 @@ impl<S: Read + Write> SmtpClient<S> {
         Ok(reply)
     }
 
+    pub fn send_bdat_chunk(
+        &mut self,
+        size: usize,
+        last: bool,
+        chunk: &[u8],
+    ) -> Result<Reply, SmtpError> {
+        let command = if last {
+            format!("BDAT {size} LAST")
+        } else {
+            format!("BDAT {size}")
+        };
+        self.write_all(command.as_bytes())?;
+        self.write_all(b"\r\n")?;
+        self.stream.write_all(chunk)?;
+        self.stream.flush()?;
+        self.read_reply()
+    }
+
     pub fn write_data(&mut self, data: &[u8]) -> Result<(), SmtpError> {
         let mut start = 0usize;
         while start < data.len() {
@@ -260,6 +278,15 @@ mod tests {
         assert_eq!(reply.code, 250);
         assert_eq!(reply.lines.len(), 3);
         assert_eq!(reply.lines[2], "AUTH PLAIN");
+    }
+
+    #[test]
+    fn sends_bdat_chunk_without_dot_stuffing() {
+        let mut client = client_with_replies(VecDeque::from(["250 ok\r\n"]));
+        let reply = client.send_bdat_chunk(5, true, b".a\0bc").unwrap();
+        assert_eq!(reply.code, 250);
+        let output = client.into_inner().output;
+        assert_eq!(output, b"BDAT 5 LAST\r\n.a\0bc".to_vec());
     }
 
     #[test]

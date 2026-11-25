@@ -155,6 +155,18 @@ fn now_secs() -> i64 {
 
 fn release_at(job: &OutboundJob) -> Option<i64> {
     let value = job.future_release.as_deref()?;
+    if let Some(seconds) = value.strip_prefix("for;") {
+        let seconds = seconds.parse::<i64>().ok()?;
+        let base = if job.created_at > 0 {
+            job.created_at
+        } else {
+            now_secs()
+        };
+        return Some(base.saturating_add(seconds));
+    }
+    if let Some(epoch) = value.strip_prefix("until;") {
+        return epoch.parse::<i64>().ok();
+    }
     let seconds = value
         .split_whitespace()
         .next()
@@ -170,15 +182,24 @@ fn release_at(job: &OutboundJob) -> Option<i64> {
 fn deliver_deadline(job: &OutboundJob) -> Option<i64> {
     let value = job.deliver_by.as_deref()?;
     let seconds = value
-        .split_whitespace()
+        .split(';')
         .next()
-        .and_then(|token| token.parse::<u64>().ok())?;
+        .and_then(|token| token.parse::<i64>().ok())?;
     let base = if job.created_at > 0 {
         job.created_at
     } else {
         now_secs()
     };
-    Some(base.saturating_add(seconds as i64))
+    Some(base.saturating_add(seconds))
+}
+
+fn deliver_by_mode(job: &OutboundJob) -> char {
+    job.deliver_by
+        .as_deref()
+        .and_then(|value| value.split(';').nth(1))
+        .and_then(|mode| mode.chars().next())
+        .map(|mode| mode.to_ascii_uppercase())
+        .unwrap_or('R')
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -210,7 +231,7 @@ fn deliver_with_retry(
         }
     }
     if let Some(deadline) = deliver_deadline(job) {
-        if now >= deadline {
+        if now >= deadline && deliver_by_mode(job) == 'R' {
             fail_permanently(
                 hostname,
                 dsn_enabled,
@@ -218,39 +239,57 @@ fn deliver_with_retry(
                 sender,
                 job,
                 "delivery time expired",
+                "5.4.7",
                 true,
             );
             return;
         }
     }
     let raw = match dkim {
-        Some(settings) => match crate::email_auth::sign_dkim(settings, &job.raw) {
-            Ok(raw) => raw,
-            Err(error) => {
-                eprintln!("dkim signing {} -> {}: {error}", job.from, job.to);
-                job.raw.clone()
-            }
-        },
+        Some(settings) => crate::email_auth::sign_outbound(
+            settings,
+            hostname,
+            &job.from,
+            std::slice::from_ref(&job.to),
+            &job.raw,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("outbound signing {} -> {}: {error}", job.from, job.to);
+            job.raw.clone()
+        }),
         None => job.raw.clone(),
     };
     let mut delay = Duration::from_secs(1);
     let mut last_error = String::new();
+    let mut delayed_sent = false;
     for attempt in 1..=3 {
         if let Some(deadline) = deliver_deadline(job) {
             if now_secs() >= deadline {
-                fail_permanently(
-                    hostname,
-                    dsn_enabled,
-                    dir,
-                    sender,
-                    job,
-                    "delivery time expired",
-                    true,
-                );
-                return;
+                if deliver_by_mode(job) == 'R' {
+                    fail_permanently(
+                        hostname,
+                        dsn_enabled,
+                        dir,
+                        sender,
+                        job,
+                        "delivery time expired",
+                        "5.4.7",
+                        true,
+                    );
+                    return;
+                }
+                if !delayed_sent && dsn_enabled && !job.dsn && !job.from.is_empty() {
+                    send_dsn(
+                        dir,
+                        sender,
+                        job,
+                        crate::dsn::build_delayed_dsn(job, hostname),
+                    );
+                    delayed_sent = true;
+                }
             }
         }
-        match deliver_once(hostname, tls, policy, dane, job, &raw) {
+        match deliver_once(hostname, tls, policy, dane, reports, job, &raw) {
             Ok(()) => {
                 eprintln!("outbound {} -> {}: delivered", job.from, job.to);
                 let wants_success = job
@@ -258,26 +297,12 @@ fn deliver_with_retry(
                     .as_deref()
                     .is_some_and(|notify| notify.split(',').any(|value| value == "SUCCESS"));
                 if wants_success && dsn_enabled && !job.dsn && !job.from.is_empty() {
-                    let raw = crate::dsn::build_success_dsn(job, hostname);
-                    let dsn_job = OutboundJob {
-                        id: String::new(),
-                        from: String::new(),
-                        to: job.from.clone(),
-                        raw,
-                        message_id: job.message_id.clone(),
-                        dsn: true,
-                        require_tls: false,
-                        dsn_ret: None,
-                        envid: job.envid.clone(),
-                        notify: None,
-                        orcpt: None,
-                        future_release: None,
-                        deliver_by: None,
-                        created_at: now_secs(),
-                    };
-                    if let Some(dsn_job) = write_job(dir, dsn_job) {
-                        let _ = sender.send(dsn_job);
-                    }
+                    send_dsn(
+                        dir,
+                        sender,
+                        job,
+                        crate::dsn::build_success_dsn(job, hostname),
+                    );
                 }
                 let _ = fs::remove_file(dir.join(format!("{}.bin", job.id)));
                 return;
@@ -311,8 +336,60 @@ fn deliver_with_retry(
         sender,
         job,
         "delivery attempt failed",
+        "5.0.0",
         false,
     );
+}
+
+fn send_dsn(dir: &Path, sender: &Sender<OutboundJob>, job: &OutboundJob, raw: Vec<u8>) {
+    let dsn_job = OutboundJob {
+        id: String::new(),
+        from: String::new(),
+        to: job.from.clone(),
+        raw,
+        message_id: job.message_id.clone(),
+        dsn: true,
+        require_tls: false,
+        dsn_ret: None,
+        envid: job.envid.clone(),
+        notify: None,
+        orcpt: None,
+        future_release: None,
+        deliver_by: None,
+        created_at: now_secs(),
+    };
+    if let Some(dsn_job) = write_job(dir, dsn_job) {
+        let _ = sender.send(dsn_job);
+    }
+}
+
+fn record_tls_success(
+    reports: &Reports,
+    job: &OutboundJob,
+    host: &str,
+    require_tls: bool,
+    dane: bool,
+) {
+    let Some(domain) = job.to.rsplit_once('@').map(|(_, domain)| domain) else {
+        return;
+    };
+    let Some(rua) = crate::tls_policy::tls_rpt_policy(domain) else {
+        return;
+    };
+    let destinations = rua
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let policy_type = if dane {
+        "dane"
+    } else if require_tls {
+        "sts"
+    } else {
+        "smtp-tls"
+    };
+    reports.record_tls_success(domain, &destinations, policy_type, &job.from, host);
 }
 
 fn record_tls_failure(reports: &Reports, job: &OutboundJob, error: &str) {
@@ -350,6 +427,7 @@ fn record_tls_failure(reports: &Reports, job: &OutboundJob, error: &str) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fail_permanently(
     hostname: &str,
     dsn_enabled: bool,
@@ -357,6 +435,7 @@ fn fail_permanently(
     sender: &Sender<OutboundJob>,
     job: &OutboundJob,
     reason: &str,
+    status: &str,
     force_remove: bool,
 ) {
     let notify = job.notify.as_deref().unwrap_or("");
@@ -364,7 +443,7 @@ fn fail_permanently(
         || (!notify.is_empty() && !notify.split(',').any(|value| value == "FAILURE"));
     let mut reported = false;
     if dsn_enabled && !job.dsn && !job.from.is_empty() && !suppress_dsn {
-        let dsn = crate::dsn::build_failure_dsn(job, hostname, reason);
+        let dsn = crate::dsn::build_failure_dsn_with_status(job, hostname, reason, status);
         let dsn_job = OutboundJob {
             id: String::new(),
             from: String::new(),
@@ -403,11 +482,13 @@ fn write_job(dir: &Path, mut job: OutboundJob) -> Option<OutboundJob> {
     Some(job)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deliver_once(
     hostname: &str,
     tls: bool,
     policy: &Arc<MtaStsCache>,
     dane: bool,
+    reports: Option<&Arc<Reports>>,
     job: &OutboundJob,
     raw: &[u8],
 ) -> Result<(), String> {
@@ -420,7 +501,7 @@ fn deliver_once(
     let require_tls = policy.check(domain, &hosts, tls)? || job.require_tls;
     let mut last_error = String::new();
     for host in hosts {
-        match deliver_host(hostname, tls, dane, require_tls, &host, job, raw) {
+        match deliver_host(hostname, tls, dane, require_tls, reports, &host, job, raw) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = error,
         }
@@ -428,11 +509,13 @@ fn deliver_once(
     Err(last_error)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deliver_host(
     hostname: &str,
     tls: bool,
     dane: bool,
     require_tls: bool,
+    reports: Option<&Arc<Reports>>,
     host: &str,
     job: &OutboundJob,
     raw: &[u8],
@@ -474,6 +557,9 @@ fn deliver_host(
         if reply.code == 220 {
             let stream = client.into_inner();
             let tls_stream = tls_stream(stream, host, &records)?;
+            if let Some(reports) = reports {
+                record_tls_success(reports, job, host, require_tls, !records.is_empty());
+            }
             let client = SmtpClient::new(tls_stream);
             return send_with_client(client, hostname, job, raw);
         }
@@ -487,7 +573,23 @@ fn send_with_client<S: std::io::Read + std::io::Write>(
     job: &OutboundJob,
     raw: &[u8],
 ) -> Result<(), String> {
-    client.ehlo(hostname).map_err(|error| error.to_string())?;
+    let ehlo = client.ehlo(hostname).map_err(|error| error.to_string())?;
+    let chunking = ehlo
+        .lines
+        .iter()
+        .any(|line| line.eq_ignore_ascii_case("CHUNKING"));
+    let binarymime = ehlo
+        .lines
+        .iter()
+        .any(|line| line.eq_ignore_ascii_case("BINARYMIME"));
+    let eightbit = ehlo
+        .lines
+        .iter()
+        .any(|line| line.eq_ignore_ascii_case("8BITMIME"));
+    let binary = raw.contains(&0);
+    if binary && !binarymime {
+        return Err("recipient does not support BINARYMIME".into());
+    }
     let mut mail = format!("MAIL FROM:<{}>", job.from);
     if let Some(ret) = &job.dsn_ret {
         mail.push_str(&format!(" RET={ret}"));
@@ -497,6 +599,21 @@ fn send_with_client<S: std::io::Read + std::io::Write>(
     }
     if job.require_tls {
         mail.push_str(" REQUIRETLS");
+    }
+    if let Some(release) = release_at(job) {
+        let remaining = release.saturating_sub(now_secs());
+        if remaining > 0 {
+            mail.push_str(&format!(" HOLDFOR={remaining}"));
+        }
+    }
+    if let Some(deadline) = deliver_deadline(job) {
+        let remaining = deadline.saturating_sub(now_secs());
+        mail.push_str(&format!(" BY={remaining};{}", deliver_by_mode(job)));
+    }
+    if binary {
+        mail.push_str(" BODY=BINARYMIME");
+    } else if eightbit && raw.iter().any(|byte| *byte >= 0x80) {
+        mail.push_str(" BODY=8BITMIME");
     }
     let reply = client.command(&mail).map_err(|error| error.to_string())?;
     if reply.code != 250 {
@@ -513,14 +630,23 @@ fn send_with_client<S: std::io::Read + std::io::Write>(
     if !(250..260).contains(&reply.code) {
         return Err(format!("RCPT rejected: {reply}"));
     }
-    let reply = client.command("DATA").map_err(|error| error.to_string())?;
-    if reply.code != 354 {
-        return Err(format!("DATA rejected: {reply}"));
-    }
-    client.write_data(raw).map_err(|error| error.to_string())?;
-    let reply = client.read_reply().map_err(|error| error.to_string())?;
-    if reply.code != 250 {
-        return Err(format!("message rejected: {reply}"));
+    if chunking {
+        let reply = client
+            .send_bdat_chunk(raw.len(), true, raw)
+            .map_err(|error| error.to_string())?;
+        if reply.code != 250 {
+            return Err(format!("BDAT rejected: {reply}"));
+        }
+    } else {
+        let reply = client.command("DATA").map_err(|error| error.to_string())?;
+        if reply.code != 354 {
+            return Err(format!("DATA rejected: {reply}"));
+        }
+        client.write_data(raw).map_err(|error| error.to_string())?;
+        let reply = client.read_reply().map_err(|error| error.to_string())?;
+        if reply.code != 250 {
+            return Err(format!("message rejected: {reply}"));
+        }
     }
     let _ = client.quit();
     Ok(())
@@ -598,10 +724,11 @@ mod tests {
     #[test]
     fn computes_release_and_deadline() {
         let mut job = job();
-        job.future_release = Some("3600".into());
+        job.future_release = Some("for;3600".into());
         assert_eq!(release_at(&job), Some(4600));
-        job.deliver_by = Some("86400 R".into());
+        job.deliver_by = Some("86400;R".into());
         assert_eq!(deliver_deadline(&job), Some(87400));
+        assert_eq!(deliver_by_mode(&job), 'R');
     }
 
     #[test]
