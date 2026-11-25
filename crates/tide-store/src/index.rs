@@ -922,9 +922,6 @@ impl ShardedIndex {
     }
 
     pub fn insert(&self, message: &Message) {
-        if self.find_shard(&message.id).is_some() {
-            self.delete(&message.id);
-        }
         let shard = self.shard_for(&message.account_id);
         self.shards[shard].write().insert(message);
     }
