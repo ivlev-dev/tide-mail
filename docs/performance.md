@@ -19,16 +19,16 @@ cargo run --release -p tide-store --example bench
 ## Результат на тестовой машине
 
 ```text
-messages=5000 append=212ms (23550/s) snapshot=24ms search100=80ms hits=5000 reopen=19.8ms
-same-account concurrent messages=16000 append=359ms (44571/s) apply_pending=16000
+messages=5000 append=178ms (28048/s) snapshot=23ms search100=2.1ms hits=5000 reopen=19ms
+same-account concurrent messages=16000 append=345ms (46311/s) apply_pending=16000
 ```
 
 | Метрика | Значение |
 |---|---|
-| durable append, один поток | ~23 500 msg/s |
-| group commit, 16 потоков | ~44 500 msg/s |
+| durable append, один поток | ~28 000 msg/s |
+| group commit, 16 потоков | ~46 000 msg/s |
 | snapshot 5k | ~25 мс |
-| поиск | ~0.80 мс/запрос |
+| поиск, первый запрос | ~0.8 мс |
 | reopen со снапшотом | ~19.9 мс |
 
 Цифры зависят от диска: `RWF_DSYNC` упирается в fsync/кэш накопителя. На NVMe результаты выше, на HDD — ниже.
@@ -49,6 +49,8 @@ same-account concurrent messages=16000 append=359ms (44571/s) apply_pending=1600
 12. **Blob-store.** Вложения вынесены из payload, дедуплицируются по SHA-256.
 13. **Stopwords/HashSet.** Линейный поиск по списку стоп-слов заменён на HashSet, ASCII-токены не проходят Unicode-lowercase.
 14. **API stats без клонирования.** `account_stats` больше не копирует тела всех писем аккаунта при каждом list/mailboxes.
+15. **pwritev2 + RWF_DSYNC.** Lane-запись ушла с io_uring-SQE на прямой `pwritev2`, сеть остаётся на io_uring. Это дало ~17% на append.
+16. **Кэш поисковых запросов.** 512 запросов на шард с инвалидацией по версии; повторные запросы ~20 мкс.
 
 ## Узкие места
 

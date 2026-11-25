@@ -6,7 +6,7 @@ use std::sync::mpsc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use futures_channel::oneshot;
-use io_uring::{IoUring, opcode, types};
+use io_uring::IoUring;
 
 use crate::batch::{DecodedBatch, NewBatch, encode_batch};
 use crate::error::StoreError;
@@ -419,7 +419,7 @@ fn persist_lane_header(file: &File, state: &LaneState) -> Result<(), StoreError>
 }
 
 pub(crate) fn write_all_at(
-    ring: &mut IoUring,
+    _ring: &mut IoUring,
     fd: RawFd,
     bytes: &[u8],
     offset: u64,
@@ -428,30 +428,21 @@ pub(crate) fn write_all_at(
     let mut written = 0usize;
     while written < bytes.len() {
         let slice = &bytes[written..];
-        let entry = opcode::Write::new(types::Fd(fd), slice.as_ptr(), slice.len() as u32)
-            .offset(offset + written as u64)
-            .rw_flags(if durable { libc::RWF_DSYNC } else { 0 })
-            .build()
-            .user_data(1);
-        unsafe {
-            ring.submission()
-                .push(&entry)
-                .map_err(|_| StoreError::Internal("io_uring submission queue full".into()))?;
-        }
-        ring.submit_and_wait(1).map_err(StoreError::Io)?;
-        let completion = ring
-            .completion()
-            .next()
-            .ok_or_else(|| StoreError::Internal("io_uring completion queue empty".into()))?;
-        let result = completion.result();
+        let iovec = libc::iovec {
+            iov_base: slice.as_ptr() as *mut libc::c_void,
+            iov_len: slice.len(),
+        };
+        let flags = if durable { libc::RWF_DSYNC } else { 0 };
+        let result =
+            unsafe { libc::pwritev2(fd, &iovec, 1, (offset + written as u64) as i64, flags) };
         if result < 0 {
-            return Err(StoreError::Io(std::io::Error::from_raw_os_error(-result)));
+            return Err(StoreError::Io(std::io::Error::last_os_error()));
         }
         let result = result as usize;
         if result == 0 {
             return Err(StoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
-                "io_uring write returned zero",
+                "pwritev2 returned zero",
             )));
         }
         written += result;

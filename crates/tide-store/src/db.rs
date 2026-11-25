@@ -244,6 +244,30 @@ impl ApplyHandle {
             .await
             .map_err(|_| StoreError::Internal("apply worker stopped".into()))?
     }
+
+    fn submit_detached(
+        &self,
+        lane_id: u16,
+        seq: u64,
+        batch_offset: u64,
+        batch_len: u64,
+        records: Vec<Record>,
+        decoded_messages: Vec<Option<Message>>,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = futures_channel::oneshot::channel();
+        drop(receiver);
+        self.tx
+            .send(ApplyCommand::Job(ApplyJob {
+                lane_id,
+                seq,
+                batch_offset,
+                batch_len,
+                records,
+                decoded_messages,
+                reply,
+            }))
+            .map_err(|_| StoreError::Internal("apply worker stopped".into()))
+    }
 }
 
 impl Drop for ApplyHandle {
@@ -557,14 +581,37 @@ impl Db {
             .await
     }
 
+    pub async fn append_message_fast(&self, message: Message) -> Result<Receipt, StoreError> {
+        message.validate()?;
+        let account_id = message.account_id.clone();
+        let payload = message.encode()?;
+        let batch = NewBatch::single(Record::message(message.id.clone(), payload));
+        self.append_prepared_inner(&account_id, batch, vec![Some(message)], false)
+            .await
+    }
+
+    pub async fn append_message_with_blobs_fast(
+        &self,
+        message: Message,
+    ) -> Result<Receipt, StoreError> {
+        let (batch, decoded, account_id) = self.prepare_blobbed(message)?;
+        self.append_prepared_inner(&account_id, batch, decoded, false)
+            .await
+    }
+
     pub fn append_message_blocking(&self, message: Message) -> Result<Receipt, StoreError> {
         futures::executor::block_on(self.append_message(message))
     }
 
-    pub async fn append_message_with_blobs(
+    pub async fn append_message_with_blobs(&self, message: Message) -> Result<Receipt, StoreError> {
+        let (batch, decoded, account_id) = self.prepare_blobbed(message)?;
+        self.append_prepared(&account_id, batch, decoded).await
+    }
+
+    fn prepare_blobbed(
         &self,
         mut message: Message,
-    ) -> Result<Receipt, StoreError> {
+    ) -> Result<(NewBatch, Vec<Option<Message>>, String), StoreError> {
         message.validate()?;
         let account_id = message.account_id.clone();
         let message_id = message.id.clone();
@@ -593,8 +640,7 @@ impl Db {
             ));
             decoded.push(None);
         }
-        let batch = NewBatch::new(records);
-        self.append_prepared(&account_id, batch, decoded).await
+        Ok((NewBatch::new(records), decoded, account_id))
     }
 
     pub async fn get_attachment(
@@ -677,9 +723,21 @@ impl Db {
         batch: NewBatch,
         decoded_messages: Vec<Option<Message>>,
     ) -> Result<Receipt, StoreError> {
+        self.append_prepared_inner(account_id, batch, decoded_messages, true)
+            .await
+    }
+
+    async fn append_prepared_inner(
+        &self,
+        account_id: &str,
+        batch: NewBatch,
+        decoded_messages: Vec<Option<Message>>,
+        wait_apply: bool,
+    ) -> Result<Receipt, StoreError> {
         let _gate = self.gate.read().await;
         let lane = self.lane_for_account(account_id);
-        self.commit_lane_locked(lane, batch, decoded_messages).await
+        self.commit_lane_locked(lane, batch, decoded_messages, wait_apply)
+            .await
     }
 
     async fn commit_lane_locked(
@@ -687,20 +745,32 @@ impl Db {
         lane: LaneWriter,
         batch: NewBatch,
         decoded_messages: Vec<Option<Message>>,
+        wait_apply: bool,
     ) -> Result<Receipt, StoreError> {
         let records = batch.records.clone();
         let receipt = lane.append(batch).await?;
-        self.state()
-            .apply
-            .submit(
+        let apply = &self.state().apply;
+        if wait_apply {
+            apply
+                .submit(
+                    receipt.lane_id,
+                    receipt.seq,
+                    receipt.offset,
+                    receipt.total_len,
+                    records,
+                    decoded_messages,
+                )
+                .await?;
+        } else {
+            apply.submit_detached(
                 receipt.lane_id,
                 receipt.seq,
                 receipt.offset,
                 receipt.total_len,
                 records,
                 decoded_messages,
-            )
-            .await?;
+            )?;
+        }
         Ok(receipt)
     }
 
@@ -989,7 +1059,7 @@ impl Db {
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
-        self.commit_lane_locked(lane, NewBatch::single(Record::delete(id)), vec![None])
+        self.commit_lane_locked(lane, NewBatch::single(Record::delete(id)), vec![None], true)
             .await
     }
 
@@ -1002,8 +1072,13 @@ impl Db {
             .get(location.lane_id as usize)
             .ok_or_else(|| StoreError::corrupt("lane out of bounds"))?
             .clone();
-        self.commit_lane_locked(lane, NewBatch::single(Record::flags(id, flags)), vec![None])
-            .await
+        self.commit_lane_locked(
+            lane,
+            NewBatch::single(Record::flags(id, flags)),
+            vec![None],
+            true,
+        )
+        .await
     }
 
     pub async fn move_message(
@@ -1029,6 +1104,7 @@ impl Db {
             lane,
             NewBatch::single(Record::new(KIND_MOVE, id, payload)),
             vec![None],
+            true,
         )
         .await
     }

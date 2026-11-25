@@ -1,4 +1,5 @@
 use parking_lot::RwLock;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -14,7 +15,7 @@ const SUBJECT_WEIGHT: f64 = 2.5;
 const BODY_WEIGHT: f64 = 1.0;
 const FROM_WEIGHT: f64 = 1.5;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct SearchQuery {
     pub account_id: Option<String>,
     pub mailbox: Option<String>,
@@ -620,48 +621,70 @@ fn char_to_byte(value: &str, char_index: usize) -> usize {
 
 fn tokenize(value: &str) -> Vec<String> {
     let mut result = Vec::new();
-    for word in value.unicode_words() {
-        let lower = if word.is_ascii() {
-            word.to_ascii_lowercase()
-        } else {
-            word.to_lowercase()
-        };
-        let trimmed = lower.trim_matches(|character: char| {
-            !character.is_alphanumeric() && character != '_' && character != '-'
-        });
-        if trimmed.len() < 2 || trimmed.len() > 64 || is_stopword(trimmed) {
-            continue;
+    if value.is_ascii() {
+        for word in value.split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+        }) {
+            push_token(word, &mut result);
         }
-        let stemmed = stem_cached(trimmed, trimmed.chars().any(is_cyrillic));
-        if !stemmed.is_empty() {
-            result.push(stemmed);
+    } else {
+        for word in value.unicode_words() {
+            push_token(word, &mut result);
         }
     }
     result
 }
 
+fn push_token(word: &str, result: &mut Vec<String>) {
+    let lower = if word.is_ascii() {
+        word.to_ascii_lowercase()
+    } else {
+        word.to_lowercase()
+    };
+    let trimmed = lower.trim_matches(|character: char| {
+        !character.is_alphanumeric() && character != '_' && character != '-'
+    });
+    if trimmed.len() < 2 || trimmed.len() > 64 || is_stopword(trimmed) {
+        return;
+    }
+    let stemmed = stem_cached(trimmed, trimmed.chars().any(is_cyrillic));
+    if !stemmed.is_empty() {
+        result.push(stemmed);
+    }
+}
+
 fn stem_cached(token: &str, cyrillic: bool) -> String {
-    static ENGLISH: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
-    static RUSSIAN: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
-    let cache = if cyrillic {
-        RUSSIAN.get_or_init(|| RwLock::new(HashMap::new()))
-    } else {
-        ENGLISH.get_or_init(|| RwLock::new(HashMap::new()))
-    };
-    if let Some(value) = cache.read().get(token) {
-        return value.clone();
+    thread_local! {
+        static ENGLISH: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+        static RUSSIAN: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     }
-    let value = if cyrillic {
-        russian_stemmer().stem(token).into_owned()
+    if cyrillic {
+        RUSSIAN.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(value) = cache.get(token) {
+                return value.clone();
+            }
+            let value = russian_stemmer().stem(token).into_owned();
+            if cache.len() > 100_000 {
+                cache.clear();
+            }
+            cache.insert(token.to_string(), value.clone());
+            value
+        })
     } else {
-        english_stemmer().stem(token).into_owned()
-    };
-    let mut cache = cache.write();
-    if cache.len() > 100_000 {
-        cache.clear();
+        ENGLISH.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(value) = cache.get(token) {
+                return value.clone();
+            }
+            let value = english_stemmer().stem(token).into_owned();
+            if cache.len() > 100_000 {
+                cache.clear();
+            }
+            cache.insert(token.to_string(), value.clone());
+            value
+        })
     }
-    cache.insert(token.to_string(), value.clone());
-    value
 }
 
 fn is_cyrillic(character: char) -> bool {
@@ -880,6 +903,14 @@ pub struct ShardedIndexSnapshot {
 
 pub struct ShardedIndex {
     shards: Vec<RwLock<SearchIndex>>,
+    cache: RwLock<HashMap<SearchQuery, CachedSearch>>,
+    version: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone)]
+struct CachedSearch {
+    version: u64,
+    hits: Vec<SearchHit>,
 }
 
 impl Default for ShardedIndex {
@@ -894,12 +925,21 @@ impl ShardedIndex {
             shards: (0..shards.max(1))
                 .map(|_| RwLock::new(SearchIndex::new()))
                 .collect(),
+            cache: RwLock::new(HashMap::new()),
+            version: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn invalidate(&self) {
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn from_snapshot(snapshot: ShardedIndexSnapshot) -> Self {
         Self {
             shards: snapshot.shards.into_iter().map(RwLock::new).collect(),
+            cache: RwLock::new(HashMap::new()),
+            version: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -931,17 +971,20 @@ impl ShardedIndex {
     pub fn insert(&self, message: &Message) {
         let shard = self.shard_for(&message.account_id);
         self.shards[shard].write().insert(message);
+        self.invalidate();
     }
 
     pub fn delete(&self, id: &str) {
         if let Some(shard) = self.find_shard(id) {
             self.shards[shard].write().delete(id);
+            self.invalidate();
         }
     }
 
     pub fn update_flags(&self, id: &str, flags: u64) {
         if let Some(shard) = self.find_shard(id) {
             self.shards[shard].write().update_flags(id, flags);
+            self.invalidate();
         }
     }
 
@@ -954,6 +997,7 @@ impl ShardedIndex {
             self.shards[target]
                 .write()
                 .move_message(id, account_id, mailbox);
+            self.invalidate();
             return;
         }
         let doc = self.shards[old_shard].read().get(id).cloned();
@@ -962,6 +1006,7 @@ impl ShardedIndex {
             doc.account_id = account_id.to_string();
             doc.mailbox = mailbox.to_string();
             self.shards[target].write().insert_doc(doc);
+            self.invalidate();
         }
     }
 
@@ -1013,6 +1058,7 @@ impl ShardedIndex {
                 index.insert(message);
             }
         }
+        self.invalidate();
     }
 
     pub fn docs_for_account(&self, account_id: &str) -> Vec<Doc> {
@@ -1034,6 +1080,28 @@ impl ShardedIndex {
     }
 
     pub fn search(&self, query: &SearchQuery) -> Vec<SearchHit> {
+        let version = self.version.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(cached) = self.cache.read().get(query) {
+            if cached.version == version {
+                return cached.hits.clone();
+            }
+        }
+        let hits = self.search_uncached(query);
+        let mut cache = self.cache.write();
+        if cache.len() > 512 {
+            cache.clear();
+        }
+        cache.insert(
+            query.clone(),
+            CachedSearch {
+                version,
+                hits: hits.clone(),
+            },
+        );
+        hits
+    }
+
+    fn search_uncached(&self, query: &SearchQuery) -> Vec<SearchHit> {
         if let Some(account) = &query.account_id {
             return self.shards[self.shard_for(account)].read().search(query);
         }
