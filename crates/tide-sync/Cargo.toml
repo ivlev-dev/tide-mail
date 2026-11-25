@@ -12,6 +12,7 @@ rust-version.workspace = true
 parking_lot.workspace = true
 silent-protocol.workspace = true
 thiserror.workspace = true
+tide-core = { path = "../tide-core" }
 tide-proto = { path = "../tide-proto" }
 
 [dev-dependencies]

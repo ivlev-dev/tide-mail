@@ -4,8 +4,8 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use silent_protocol::SilentProto;
 use tide_proto::{
-    BlobChunk, Cursor, MessageMeta, SyncChange, SyncChanges, SyncOperation, SyncPushResult,
-    SyncReject, change_kind, op_kind,
+    Address, BlobChunk, Cursor, MessageMeta, PutMessagePayload, SyncChange, SyncChanges,
+    SyncOperation, SyncPushResult, SyncReject, change_kind, op_kind,
 };
 
 use crate::SyncError;
@@ -182,26 +182,68 @@ impl SyncBackend for InMemoryBackend {
         for operation in operations {
             let seq = changes.last().map_or(1, |change| change.seq + 1);
             let mut change = match operation.kind {
-                op_kind::PUT_MESSAGE => match MessageMeta::decode(&operation.payload) {
-                    Ok(meta) => SyncChange {
+                op_kind::PUT_MESSAGE => {
+                    let meta = match PutMessagePayload::decode(&operation.payload) {
+                        Ok(payload) if payload.account_id == account_id => {
+                            let message_id = if payload.message_id.is_empty() {
+                                format!("sync-{}", seq)
+                            } else {
+                                payload.message_id
+                            };
+                            match tide_core::parse_message(
+                                &payload.raw,
+                                account_id,
+                                &payload.mailbox,
+                                message_id,
+                            ) {
+                                Ok(mut message) => {
+                                    message.flags = payload.flags;
+                                    Some(meta_from_message(&message))
+                                }
+                                Err(error) => {
+                                    rejected.push(SyncReject {
+                                        message_id: operation.message_id,
+                                        code: 400,
+                                        message: error.to_string(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            rejected.push(SyncReject {
+                                message_id: operation.message_id,
+                                code: 403,
+                                message: "account mismatch".into(),
+                            });
+                            continue;
+                        }
+                        Err(_) => match MessageMeta::decode(&operation.payload) {
+                            Ok(meta) => Some(meta),
+                            Err(error) => {
+                                rejected.push(SyncReject {
+                                    message_id: operation.message_id,
+                                    code: 400,
+                                    message: format!("invalid message payload: {error}"),
+                                });
+                                continue;
+                            }
+                        },
+                    };
+                    SyncChange {
                         kind: change_kind::UPSERT,
-                        message_id: operation.message_id,
+                        message_id: meta
+                            .as_ref()
+                            .map(|meta| meta.id.clone())
+                            .unwrap_or_else(|| operation.message_id.clone()),
                         seq,
-                        meta: Some(meta),
+                        meta,
                         flags: None,
                         mailbox: None,
                         deleted: false,
                         payload: Vec::new(),
-                    },
-                    Err(error) => {
-                        rejected.push(SyncReject {
-                            message_id: operation.message_id,
-                            code: 400,
-                            message: format!("invalid message meta: {error}"),
-                        });
-                        continue;
                     }
-                },
+                }
                 op_kind::FLAGS => {
                     let meta = find_meta(&changes, &operation.message_id).cloned();
                     SyncChange {
@@ -299,6 +341,45 @@ impl SyncBackend for InMemoryBackend {
             data: data[start..end].to_vec(),
             eof: end == data.len(),
         })
+    }
+}
+
+fn meta_from_message(message: &tide_core::Message) -> MessageMeta {
+    MessageMeta {
+        id: message.id.clone(),
+        account_id: message.account_id.clone(),
+        mailbox: message.mailbox.clone(),
+        thread_id: message.thread_id.clone(),
+        message_id: message.message_id.clone(),
+        subject: message.subject.clone(),
+        from: message
+            .from
+            .iter()
+            .map(|address| Address {
+                email: address.email.clone(),
+                name: address.name.clone(),
+            })
+            .collect(),
+        to: message
+            .to
+            .iter()
+            .map(|address| Address {
+                email: address.email.clone(),
+                name: address.name.clone(),
+            })
+            .collect(),
+        cc: message
+            .cc
+            .iter()
+            .map(|address| Address {
+                email: address.email.clone(),
+                name: address.name.clone(),
+            })
+            .collect(),
+        date: message.date,
+        flags: message.flags,
+        size: message.size,
+        snippet: message.body_text.chars().take(160).collect(),
     }
 }
 

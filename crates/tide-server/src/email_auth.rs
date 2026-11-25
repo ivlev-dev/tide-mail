@@ -113,3 +113,27 @@ pub fn sign_dkim(settings: &DkimSettings, raw: &[u8]) -> Result<Vec<u8>, String>
     signed.extend_from_slice(raw);
     Ok(signed)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DkimSettings;
+
+    #[test]
+    fn signs_message_with_dkim() {
+        let settings = DkimSettings {
+            domain: "mail.local".into(),
+            selector: "default".into(),
+            private_key_path: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/data/dkim_test.key"),
+            ),
+        };
+        let raw = b"From: alice@mail.local\r\nTo: bob@example.com\r\nSubject: DKIM\r\nDate: Tue, 25 Nov 2025 12:00:00 +0000\r\nMessage-ID: <dkim@mail.local>\r\n\r\nHello\r\n";
+        let signed = sign_dkim(&settings, raw).unwrap();
+        let text = String::from_utf8_lossy(&signed);
+        assert!(text.starts_with("DKIM-Signature:"));
+        assert!(text.contains("d=mail.local"));
+        assert!(text.ends_with("Hello\r\n"));
+    }
+}

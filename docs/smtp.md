@@ -52,8 +52,21 @@
 
 При `email_auth.enabled = true` сервер проверяет SPF, DKIM и DMARC через `mail-auth` и добавляет заголовок `Authentication-Results` перед сохранением. Проверка выполняется в blocking-пуле, чтобы не блокировать io_uring runtime.
 
+```toml
+[email_auth]
+enabled = true
+reject_spf_fail = false
+reject_dmarc_fail = false
+
+[dkim]
+domain = "mail.local"
+selector = "default"
+private_key_path = "./certs/dkim.key"
+```
+
 - `reject_spf_fail` — отклонять `Fail`/`SoftFail` SPF.
 - `reject_dmarc_fail` — отклонять при `DMARC Fail` и политике `reject`.
+- `[dkim]` включает подпись исходящих писем.
 
 ## Отправка
 
