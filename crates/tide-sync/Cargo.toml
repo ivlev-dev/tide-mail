@@ -1,0 +1,18 @@
+[package]
+name = "tide-sync"
+description = "Sans-IO binary mail synchronization protocol library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+silent-protocol.workspace = true
+thiserror.workspace = true
+tide-proto = { path = "../tide-proto" }
+
+[dev-dependencies]
+tempfile.workspace = true

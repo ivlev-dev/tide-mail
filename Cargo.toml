@@ -11,6 +11,7 @@ repository = "https://github.com/ivlev-dev/tide-mail"
 rust-version = "1.85"
 
 [workspace.dependencies]
+base64 = "0.22"
 byteorder = "1"
 crc32c = "0.6"
 crossbeam-channel = "0.5"
